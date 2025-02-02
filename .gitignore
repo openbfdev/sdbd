@@ -2,3 +2,4 @@
 /.cache
 /compile_commands.json
 /sdbd
+/sdbd-debug

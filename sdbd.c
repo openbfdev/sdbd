@@ -395,11 +395,26 @@ static pid_t
 spawn_shell(int *amaster, const char *path, char *cmdline)
 {
     pid_t pid;
+    char *value;
     int retval;
 
     pid = forkpty(amaster, NULL, NULL, NULL);
     if (pid != 0)
         return pid;
+
+    value = getenv("TERM");
+    if (!value) {
+        retval = setenv("TERM", "xterm-256color", 0);
+        if (retval)
+            exit(retval);
+    }
+
+    value = getenv("HOME");
+    if (value) {
+        retval = chdir(value);
+        if (retval)
+            exit(retval);
+    }
 
     retval = execl(path, path, cmdline ? "-c" : NULL, cmdline, NULL);
     if (retval)
