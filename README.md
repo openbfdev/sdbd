@@ -14,6 +14,7 @@
 - [x] Support USB hot plugging
 - [x] Shell command
 - [x] Reboot command
+- [x] Remount command
 - [ ] File sync commands (push pull)
 
 ### Support commands
@@ -21,6 +22,7 @@
 ```shell
 $ adb shell [args] ... # interactive shell
 $ adb reboot [args] ... # reboot device
+$ adb remount # remount /system
 ```
 
 ## License

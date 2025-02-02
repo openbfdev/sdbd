@@ -515,9 +515,14 @@ static struct sdbd_service *
 service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     char buff[MAX_PAYLOAD];
-
     bfdev_scnprintf(buff, sizeof(buff), "reboot %s", cmdline);
     return service_shell_open(sctx, buff);
+}
+
+static struct sdbd_service *
+service_remount_open(struct sdbd_ctx *sctx, char *cmdline)
+{
+    return service_shell_open(sctx, "mount -o remount,rw /system");
 }
 
 static struct {
@@ -531,6 +536,9 @@ services[] = {
     }, {
         .name = "reboot:",
         .open = service_reboot_open,
+    }, {
+        .name = "remount:",
+        .open = service_remount_open,
     },
 };
 
