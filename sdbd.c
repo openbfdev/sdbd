@@ -11,6 +11,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pty.h>
+#include <sys/wait.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <linux/usb/ch9.h>
@@ -215,6 +216,7 @@ struct sdbd_ctx {
 
     bfenv_eproc_event_t usbev_in;
     bfenv_eproc_event_t usbev_out;
+    bfenv_eproc_event_t sigev;
 
     struct adb_message msgbuff;
     uint32_t command;
@@ -811,6 +813,31 @@ sdbd_usb_in_handle(bfenv_eproc_event_t *event, void *pdata)
 }
 
 static int
+sdbd_signal_handle(bfenv_eproc_event_t *event, void *pdata)
+{
+    struct signalfd_siginfo si;
+    int retval;
+
+    retval = read(event->fd, &si, sizeof(si));
+    if (retval < 0) {
+        bfdev_log_emerg("signal handle: sigfd error %d\n", errno);
+        return -BFDEV_EIO;
+    }
+
+    switch (si.ssi_signo) {
+        case SIGCHLD:
+            bfdev_log_debug("signal handle: release childrens\n");
+            waitpid(-1, NULL, 0);
+            break;
+
+        default:
+            BFDEV_BUG();
+    }
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 usb_init_send(int fd)
 {
     if (write(fd, &adb_desc, sizeof(adb_desc)) != sizeof(adb_desc)) {
@@ -897,6 +924,35 @@ usb_kick(struct sdbd_ctx *sctx)
 }
 
 static int
+signal_init(struct sdbd_ctx *sctx)
+{
+    sigset_t mask;
+    int sigfd, retval;
+
+    sigemptyset(&mask);
+    sigaddset(&mask, SIGCHLD);
+
+    if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
+        return -BFDEV_EFAULT;
+
+    sigfd = signalfd(-1, &mask, 0);
+    if (sigfd < 0)
+        return -BFDEV_EFAULT;
+
+    sctx->sigev.fd = sigfd;
+    sctx->sigev.flags = BFENV_EPROC_READ;
+    sctx->sigev.priority = 100;
+    sctx->sigev.func = sdbd_signal_handle;
+    sctx->sigev.pdata = sctx;
+
+    retval = bfenv_eproc_event_add(sctx->eproc, &sctx->sigev);
+    if (retval)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 sdbd(void)
 {
     struct sdbd_ctx sctx;
@@ -908,6 +964,10 @@ sdbd(void)
     sctx.eproc = bfenv_eproc_create(NULL, "epoll");
     if (!sctx.eproc)
         return -BFDEV_EFAULT;
+
+    retval = signal_init(&sctx);
+    if (retval)
+        return retval;
 
     sctx.usbio_out = bfenv_iothread_create(NULL, USB_FIFO_DEEPTH,
         BFENV_IOTHREAD_FLAGS_SIGREAD);
