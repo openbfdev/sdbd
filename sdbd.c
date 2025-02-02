@@ -511,6 +511,15 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     return service;
 }
 
+static struct sdbd_service *
+service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
+{
+    char buff[MAX_PAYLOAD];
+
+    bfdev_scnprintf(buff, sizeof(buff), "reboot %s", cmdline);
+    return service_shell_open(sctx, buff);
+}
+
 static struct {
     const char *name;
     struct sdbd_service *(*open)(struct sdbd_ctx *sctx, char *cmdline);
@@ -519,6 +528,9 @@ services[] = {
     {
         .name = "shell:",
         .open = service_shell_open,
+    }, {
+        .name = "reboot:",
+        .open = service_reboot_open,
     },
 };
 
@@ -593,8 +605,10 @@ service_close(struct sdbd_ctx *sctx)
 
     local = sctx->args[1];
     psrv = bfdev_radix_find(&sctx->services, local);
-    if (!psrv) /* already close */
+    if (!psrv) {
+        bfdev_log_debug("service close: already close\n");
         return -BFDEV_ENOERR;
+    }
     service = *psrv;
 
     kill(service->pid, SIGKILL);
