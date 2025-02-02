@@ -12,9 +12,16 @@
 
 - [x] Daemon mode
 - [x] Support USB hot plugging
-- [x] Shell interactive
-- [x] Shell command lines
-- [ ] Sync file transfer
+- [x] Shell command
+- [x] Reboot command
+- [ ] File sync commands (push pull)
+
+### Support commands
+
+```shell
+$ adb shell [args] ... # interactive shell
+$ adb reboot [args] ... # reboot device
+```
 
 ## License
 
@@ -23,4 +30,3 @@ This is free software: you can redistribute it and/or modify it under the terms 
 This program is distributed in the hope that it will be useful, but WITHOUT ANY WARRANTY; without even the implied warranty of MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the GNU Lesser General Public License for more details.
 
 You should have received a copy of the GNU Lesser General Public License along with this program. If not, see http://www.gnu.org/licenses/.
-
