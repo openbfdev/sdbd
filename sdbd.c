@@ -24,6 +24,10 @@
 #define MODULE_NAME "sdbd"
 #define bfdev_log_fmt(fmt) MODULE_NAME ": " fmt
 
+#ifndef DEBUG
+# define BFDEV_LOGLEVEL_MAX BFDEV_LEVEL_NOTICE
+#endif
+
 #include <bfdev.h>
 #include <bfenv.h>
 
@@ -262,7 +266,7 @@ struct sdbd_sync_service {
 
     int fd;
     bfenv_iothread_t *fileio;
-    uint8_t buff[MAX_PAYLOAD];
+    uint8_t buff[SYNC_MAXDATA];
 };
 
 struct sdbd_ctx {
@@ -522,6 +526,24 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, si
     bfdev_log_debug("send data: local %u remote %u size %lu\n",
         local, remote, size);
     return send_packet(sctx, &packet);
+}
+
+static int
+send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size)
+{
+    size_t xfer;
+    int retval;
+
+    bfdev_log_debug("send datas: local %u remote %u size %lu\n",
+        local, remote, size);
+    for (; (xfer = bfdev_min(size, MAX_PAYLOAD)); size -= xfer) {
+        retval = send_data(sctx, local, remote, data, xfer);
+        if (retval)
+            return retval;
+        data += xfer;
+    }
+
+    return -BFDEV_ENOERR;
 }
 
 static pid_t
@@ -815,7 +837,7 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
     int retval;
 
     sync = bfdev_container_of(service, struct sdbd_sync_service, service);
-    bfdev_log_debug("sync send file write: inprogress %u\n", sync->inprogress);
+    bfdev_log_debug("sync send file write: inprogress %lu\n", sync->inprogress);
 
     while (length) {
         if (sync->inprogress) {
@@ -987,15 +1009,15 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_ENOERR;
     }
 
-    syncmsg.id = SYNC_CMD_DATA;
-    syncmsg.size = request.size;
+    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DATA);
+    syncmsg.size = bfdev_cpu_to_le32(request.size);
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (retval)
         return retval;
 
-    retval = send_data(sync->service.sctx, sync->service.local,
+    retval = send_datas(sync->service.sctx, sync->service.local,
         sync->service.remote, request.buffer, request.size);
     if (retval)
         return retval;
@@ -1059,7 +1081,7 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     data += sizeof(*syncmsg);
     length -= sizeof(*syncmsg);
 
-    bfdev_log_debug("sync write: remaining %u namelen %u\n", length, namelen);
+    bfdev_log_debug("sync write: remaining %lu namelen %u\n", length, namelen);
     if (namelen > SYNC_MAXNAME)
         return -BFDEV_EBADMSG;
 
