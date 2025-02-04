@@ -24,12 +24,21 @@
 #define MODULE_NAME "sdbd"
 #define bfdev_log_fmt(fmt) MODULE_NAME ": " fmt
 
+#define SDBD_VERSION "v0.1"
+#define SDBD_INFO MODULE_NAME "/" SDBD_VERSION
+
 #ifndef DEBUG
 # define BFDEV_LOGLEVEL_MAX BFDEV_LEVEL_NOTICE
 #endif
 
 #include <bfdev.h>
 #include <bfenv.h>
+
+#define USB_FFS_ADB_PATH "/dev/usb-ffs/adb/"
+#define USB_FFS_ADB_EP(x) USB_FFS_ADB_PATH#x
+#define USB_FFS_ADB_CTL USB_FFS_ADB_EP(ep0)
+#define USB_FFS_ADB_OUT USB_FFS_ADB_EP(ep1)
+#define USB_FFS_ADB_IN USB_FFS_ADB_EP(ep2)
 
 /* USB Descriptor */
 #define ADB_DESC_MAGIC 1
@@ -1468,12 +1477,12 @@ static int
 usb_init_send(int fd)
 {
     if (write(fd, &adb_desc, sizeof(adb_desc)) != sizeof(adb_desc)) {
-        bfdev_log_warn("send adb descriptors failed\n");
+        bfdev_log_err("send adb descriptors failed\n");
         return -BFDEV_EFAULT;
     }
 
     if (write(fd, &adb_str, sizeof(adb_str)) != sizeof(adb_str)) {
-        bfdev_log_warn("send adb strings failed\n");
+        bfdev_log_err("send adb strings failed\n");
         return -BFDEV_EFAULT;
     }
 
@@ -1485,21 +1494,27 @@ usb_init(struct sdbd_ctx *sctx)
 {
     int retval;
 
-    sctx->fd_ctr = open("/dev/usb-ffs/adb/ep0", O_RDWR);
-    if (sctx->fd_ctr < 0)
-        return -BFDEV_ENXIO;
+    sctx->fd_ctr = open(USB_FFS_ADB_CTL, O_RDWR);
+    if (sctx->fd_ctr < 0) {
+        bfdev_log_err("open usb control failed: %s\n", USB_FFS_ADB_CTL);
+        return -BFDEV_EACCES;
+    }
 
     retval = usb_init_send(sctx->fd_ctr);
     if (retval)
         return retval;
 
-    sctx->fd_out = open("/dev/usb-ffs/adb/ep1", O_RDONLY);
-    if (sctx->fd_out < 0)
-        return -BFDEV_ENXIO;
+    sctx->fd_out = open(USB_FFS_ADB_OUT, O_RDONLY);
+    if (sctx->fd_out < 0) {
+        bfdev_log_err("open usb out failed: %s\n", USB_FFS_ADB_OUT);
+        return -BFDEV_EACCES;
+    }
 
-    sctx->fd_in = open("/dev/usb-ffs/adb/ep2", O_WRONLY);
-    if (sctx->fd_in < 0)
-        return -BFDEV_ENXIO;
+    sctx->fd_in = open(USB_FFS_ADB_IN, O_WRONLY);
+    if (sctx->fd_in < 0) {
+        bfdev_log_err("open usb in failed: %s\n", USB_FFS_ADB_IN);
+        return -BFDEV_EACCES;
+    }
 
     sctx->usbev_out.fd = sctx->usbio_out->eventfd;
     sctx->usbev_out.flags = BFENV_EPROC_READ;
@@ -1601,26 +1616,36 @@ sdbd(void)
     sctx.services = BFDEV_RADIX_INIT(&sctx.services, NULL);
 
     sctx.eproc = bfenv_eproc_create(NULL, "epoll");
-    if (!sctx.eproc)
-        return -BFDEV_EFAULT;
+    if (!sctx.eproc) {
+        bfdev_log_err("eproc create failed\n");
+        goto error;
+    }
 
     retval = signal_init(&sctx);
-    if (retval)
-        return retval;
+    if (retval) {
+        bfdev_log_err("signal initialization failed\n");
+        goto error;
+    }
 
     sctx.usbio_out = bfenv_iothread_create(NULL, USB_FIFO_DEEPTH,
         BFENV_IOTHREAD_FLAGS_SIGREAD);
-    if (!sctx.usbio_out)
-        return -BFDEV_EFAULT;
+    if (!sctx.usbio_out) {
+        bfdev_log_err("usbio out iothread create failed\n");
+        goto error;
+    }
 
     sctx.usbio_in = bfenv_iothread_create(NULL, USB_FIFO_DEEPTH,
         BFENV_IOTHREAD_FLAGS_SIGWRITE);
-    if (!sctx.usbio_in)
-        return -BFDEV_EFAULT;
+    if (!sctx.usbio_in) {
+        bfdev_log_err("usbio in iothread create failed\n");
+        goto error;
+    }
 
     retval = usb_init(&sctx);
-    if (retval)
-        return retval;
+    if (retval) {
+        bfdev_log_err("usb initialization failed\n");
+        goto error;
+    }
 
     for (;;) {
         retval = bfenv_eproc_run(sctx.eproc, BFENV_TIMEOUT_MAX);
@@ -1633,25 +1658,18 @@ sdbd(void)
                 bfdev_log_notice("usb disconnected\n");
                 retval = usb_kick(&sctx);
                 if (retval)
-                    goto eexit;
+                    goto error;
                 break;
 
-            default: eexit:
-                bfdev_log_emerg("exit\n");
-                exit(retval);
+            default:
+                goto error;
         }
     }
 
     return -BFDEV_ENOERR;
-}
 
-static __bfdev_noreturn void
-usage(const char *path)
-{
-    bfdev_log_err("Usage: %s [option] ...\n", path);
-    bfdev_log_err("License GPLv2+: GNU GPL version 2 or later.\n");
-    bfdev_log_err("\n");
-
+error:
+    bfdev_log_emerg("failure exit\n");
     exit(1);
 }
 
@@ -1698,11 +1716,38 @@ spawn_daemon(void)
     return pid;
 }
 
+static __bfdev_noreturn void
+usage(const char *path)
+{
+    fprintf(stderr, "Usage: %s [option] ...\n", path);
+    fprintf(stderr, "Simple Debug Bridge Daemon (SDBD) " SDBD_VERSION "\n");
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "Options:\n");
+    fprintf(stderr, "  -h, --help       Display this information.\n");
+    fprintf(stderr, "  -v, --version    Display version information.\n");
+    fprintf(stderr, "  -d, --daemon     Run as daemon mode.\n");
+    fprintf(stderr, "  -t, --test       Print debug level log.\n");
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "For bug reporting, please visit:\n");
+    fprintf(stderr, "<https://github.com/openbfdev/sdbd>\n");
+    exit(1);
+}
+
+static __bfdev_noreturn void
+version(void)
+{
+    fprintf(stderr, "sdbd version: %s\n", SDBD_INFO);
+    exit(1);
+}
+
 static const struct option
 options[] = {
-    {"daemon", no_argument, 0, 'd'},
-    {"debug", no_argument, 0, 't'},
     {"help", no_argument, 0, 'h'},
+    {"version", no_argument, 0, 'v'},
+    {"daemon", no_argument, 0, 'd'},
+    {"test", no_argument, 0, 't'},
     { }, /* NULL */
 };
 
@@ -1716,7 +1761,7 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "dth", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdt", options, &optidx);
         if (arg == -1)
             break;
 
@@ -1729,8 +1774,14 @@ main(int argc, char *const argv[])
                 bfdev_log_default.record_level = BFDEV_LEVEL_DEBUG;
                 break;
 
-            case 'h': default:
-                bfdev_log_err("Unknown option: %c\n", arg);
+            case 'v':
+                version();
+
+            default:
+                fprintf(stderr, "Unknown option: %c\n", arg);
+                bfdev_fallthrough;
+
+            case 'h':
                 usage(argv[0]);
         }
     }
