@@ -56,6 +56,7 @@
 #define SYNC_CMD_SEND 0x444e4553
 #define SYNC_CMD_RECV 0x56434552
 #define SYNC_CMD_DATA 0x41544144
+#define SYNC_CMD_DENT 0x544e4544
 #define SYNC_CMD_DONE 0x454e4f44
 #define SYNC_CMD_QUIT 0x54495551
 
@@ -102,7 +103,7 @@ struct sync_stat {
     bfdev_le32 time;
 } __bfdev_packed;
 
-struct sync_dent {
+struct sync_directry {
     bfdev_le32 id;
     bfdev_le32 mode;
     bfdev_le32 size;
@@ -343,7 +344,7 @@ async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
                 break;
 
             default:
-                bfdev_log_crit("async usb write: error %d\n", errno);
+                bfdev_log_err("async usb write: error %d\n", errno);
                 return -BFDEV_EIO;
         }
     }
@@ -650,6 +651,7 @@ service_sync_close(struct sdbd_service *service)
         bfenv_iothread_destory(sync->fileio);
     }
 
+    close(sync->fd);
     bfdev_radix_free(&service->sctx->services, service->local);
     bfdev_free(NULL, service);
 }
@@ -658,16 +660,16 @@ static int
 service_sync_stat(struct sdbd_sync_service *sync, char *filename)
 {
     struct sync_stat syncmsg;
-	struct stat st;
+	struct stat stat;
     int retval;
 
     bzero(&syncmsg, sizeof(syncmsg));
 	syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_STAT);
 
-	if (!lstat(filename, &st)) {
-		syncmsg.mode = bfdev_cpu_to_le32(st.st_mode);
-		syncmsg.size = bfdev_cpu_to_le32(st.st_size);
-		syncmsg.time = bfdev_cpu_to_le32(st.st_mtime);
+	if (!lstat(filename, &stat)) {
+		syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
+		syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
+		syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
 	}
 
     retval = send_data(sync->service.sctx, sync->service.local,
@@ -681,12 +683,113 @@ service_sync_stat(struct sdbd_sync_service *sync, char *filename)
 static int
 service_sync_list(struct sdbd_sync_service *sync, char *filename)
 {
+	char buffer[PATH_MAX + 1], *fname;
+    struct sync_directry syncmsg;
+	struct stat stat;
+	size_t pathlen, filelen;
+	struct dirent *dirent;
+    int retval;
+	DIR *dir;
+
+	pathlen = strlen(filename);
+    BFDEV_BUG_ON(pathlen + 1 > PATH_MAX);
+
+	memcpy(buffer, filename, pathlen);
+	buffer[pathlen++] = '/';
+	fname = buffer + pathlen;
+
+	dir = opendir(filename);
+	if (!dir)
+        goto done;
+
+	syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DENT);
+	while ((dirent = readdir(dir))) {
+		filelen = strlen(dirent->d_name);
+        BFDEV_BUG_ON(pathlen + filelen > PATH_MAX);
+
+		strcpy(fname, dirent->d_name);
+		if (!lstat(buffer, &stat)) {
+			syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
+			syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
+			syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
+			syncmsg.namelen = bfdev_cpu_to_le32(filelen);
+
+            retval = send_data(sync->service.sctx, sync->service.local,
+                sync->service.remote, &syncmsg, sizeof(syncmsg));
+            if (retval)
+                return retval;
+
+            retval = send_data(sync->service.sctx, sync->service.local,
+                sync->service.remote, dirent->d_name, filelen);
+            if (retval)
+                return retval;
+		}
+	}
+
+	closedir(dir);
+
+done:
+	syncmsg.id = SYNC_CMD_DONE;
+	syncmsg.mode = 0;
+	syncmsg.size = 0;
+	syncmsg.time = 0;
+	syncmsg.namelen = 0;
+
+    retval = send_data(sync->service.sctx, sync->service.local,
+        sync->service.remote, &syncmsg, sizeof(syncmsg));
+    if (retval)
+        return retval;
+
     return -BFDEV_ENOERR;
+}
+
+static int
+sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode)
+{
+    return -BFDEV_EPROTONOSUPPORT;
+}
+
+static int
+sync_send_link(struct sdbd_sync_service *sync, char *filename)
+{
+    return -BFDEV_EPROTONOSUPPORT;
 }
 
 static int
 service_sync_send(struct sdbd_sync_service *sync, char *filename)
 {
+	mode_t mode;
+	char *flags;
+    bool islink;
+	int retval;
+
+	flags = strrchr(filename,',');
+	if (flags) {
+		*flags++ = '\0';
+		mode = strtoul(flags, NULL, 0);
+		islink = S_ISLNK(mode);
+		mode &= 0777;
+	}
+
+	if (!flags || errno) {
+        mode = 0644;
+        islink = 0;
+    }
+
+	if (islink) {
+        retval = sync_send_link(sync, filename);
+        if (retval)
+            return retval;
+        return -BFDEV_ENOERR;
+    }
+
+    mode |= (mode >> 3) & 0070;
+    mode |= (mode >> 3) & 0007;
+
+    retval = sync_send_file(sync, filename, mode);
+    if (retval)
+        return retval;
+
     return -BFDEV_ENOERR;
 }
 
@@ -736,12 +839,9 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 
         bfdev_log_info("shell recv handled: finish\n");
         retval = send_data(sync->service.sctx, sync->service.local,
-            sync->service.remote, request.buffer, request.size);
+            sync->service.remote, &syncmsg, sizeof(syncmsg));
         if (retval)
             return retval;
-
-        send_close(sync->service.sctx, sync->service.local, sync->service.remote);
-        service_sync_close(&sync->service);
 
         return -BFDEV_ENOERR;
     }
@@ -949,6 +1049,23 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
     return -BFDEV_ENOERR;
 }
 
+static void
+service_close(struct sdbd_ctx *sctx)
+{
+    struct sdbd_service *service, **psrv;
+    uint32_t local;
+
+    local = sctx->args[1];
+    psrv = bfdev_radix_find(&sctx->services, local);
+    if (!psrv) {
+        bfdev_log_debug("service close: already close\n");
+        return;
+    }
+
+    service = *psrv;
+    service->close(service);
+}
+
 static int
 service_write(struct sdbd_ctx *sctx, uint8_t *payload)
 {
@@ -971,25 +1088,6 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
     retval = send_okay(sctx, service->local, service->remote);
     if (retval)
         return retval;
-
-    return -BFDEV_ENOERR;
-}
-
-static int
-service_close(struct sdbd_ctx *sctx)
-{
-    struct sdbd_service *service, **psrv;
-    uint32_t local;
-
-    local = sctx->args[1];
-    psrv = bfdev_radix_find(&sctx->services, local);
-    if (!psrv) {
-        bfdev_log_debug("service close: already close\n");
-        return -BFDEV_ENOERR;
-    }
-
-    service = *psrv;
-    service->close(service);
 
     return -BFDEV_ENOERR;
 }
@@ -1019,9 +1117,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
             break;
 
         case PCMD_CLSE:
-            retval = service_close(sctx);
-            if (retval)
-                return retval;
+            service_close(sctx);
             break;
 
         case PCMD_WRTE:
@@ -1318,6 +1414,18 @@ signal_init(struct sdbd_ctx *sctx)
 }
 
 static int
+sdbd_exception(int error)
+{
+    const char *einfo;
+
+    if (!bfdev_errname(error, &einfo))
+        einfo = "Unknow error";
+    bfdev_log_crit("critical exception [%d]: %s\n", error, einfo);
+
+    return error;
+}
+
+static int
 sdbd(void)
 {
     struct sdbd_ctx sctx;
@@ -1350,24 +1458,21 @@ sdbd(void)
 
     for (;;) {
         retval = bfenv_eproc_run(sctx.eproc, BFENV_TIMEOUT_MAX);
+        if (!retval)
+            continue;
+        sdbd_exception(retval);
+
         switch (retval) {
             case -BFDEV_ESHUTDOWN:
                 bfdev_log_notice("usb disconnected\n");
                 retval = usb_kick(&sctx);
                 if (retval)
                     goto eexit;
-
                 break;
 
-            default: eexit: {
-                const char *einfo;
-
-                if (!bfdev_errname(retval, &einfo))
-                    einfo = "Unknow error";
-
-                bfdev_log_emerg("exception occurred [%d]: %s\n", retval, einfo);
+            default: eexit:
+                bfdev_log_emerg("exit\n");
                 exit(retval);
-            }
         }
     }
 
@@ -1377,9 +1482,9 @@ sdbd(void)
 static __bfdev_noreturn void
 usage(const char *path)
 {
-    bfdev_log_crit("Usage: %s [option] ...\n", path);
-    bfdev_log_crit("License GPLv2+: GNU GPL version 2 or later.\n");
-    bfdev_log_crit("\n");
+    bfdev_log_err("Usage: %s [option] ...\n", path);
+    bfdev_log_err("License GPLv2+: GNU GPL version 2 or later.\n");
+    bfdev_log_err("\n");
 
     exit(1);
 }
@@ -1393,7 +1498,7 @@ spawn_daemon(void)
     pid = fork();
     switch (pid) {
         case -1:
-            bfdev_log_alert("failed to fork daemon\n");
+            bfdev_log_err("failed to fork daemon\n");
             return -BFDEV_EFAULT;
 
         case 0:
@@ -1405,22 +1510,22 @@ spawn_daemon(void)
 
     fd = open("/dev/null", O_RDWR);
     if (fd < 0) {
-        bfdev_log_alert("failed to open null\n");
+        bfdev_log_err("failed to open null\n");
         return -BFDEV_ENXIO;
     }
 
     if (dup2(fd, STDIN_FILENO) < 0) {
-        bfdev_log_alert("failed to dup stdin\n");
+        bfdev_log_err("failed to dup stdin\n");
         return -BFDEV_ENXIO;
     }
 
     if (dup2(fd, STDOUT_FILENO) < 0) {
-        bfdev_log_alert("failed to dup stdout\n");
+        bfdev_log_err("failed to dup stdout\n");
         return -BFDEV_ENXIO;
     }
 
     if (dup2(fd, STDERR_FILENO) < 0) {
-        bfdev_log_alert("failed to dup stdout\n");
+        bfdev_log_err("failed to dup stdout\n");
         return -BFDEV_ENXIO;
     }
 
@@ -1442,7 +1547,7 @@ main(int argc, char *const argv[])
     int retval;
 
     sdbd_daemon = false;
-    bfdev_log_default.record_level = BFDEV_LEVEL_ERR;
+    bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
         arg = getopt_long(argc, argv, "dth", options, &optidx);
