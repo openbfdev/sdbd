@@ -42,6 +42,7 @@
 #define ADB_DEVICE_BANNER "device"
 #define MAX_PAYLOAD 4096
 #define SYNC_MAXNAME 1024
+#define SYNC_MAXDATA 65536
 
 /* ADB Command */
 #define PCMD_CNXN 0x4e584e43
@@ -257,6 +258,7 @@ struct sdbd_shell_service {
 struct sdbd_sync_service {
     struct sdbd_service service;
     bfenv_eproc_event_t event;
+    size_t inprogress;
 
     int fd;
     bfenv_iothread_t *fileio;
@@ -287,15 +289,15 @@ struct sdbd_ctx {
 };
 
 static int
-async_write(int fd, const void *data, size_t size)
+sdbd_read(int fd, void *data, size_t size)
 {
     size_t count;
     ssize_t rlen;
 
     count = 0;
     do {
-        rlen = write(fd, data, size - count);
-        if (rlen > 0) {
+        rlen = read(fd, data, size - count);
+        if (rlen >= 0) {
             count += rlen;
             data += rlen;
             continue;
@@ -306,12 +308,45 @@ async_write(int fd, const void *data, size_t size)
                 break;
 
             case EAGAIN:
-                bfdev_log_debug("async write: iowaitting...\n");
+                bfdev_log_debug("sdbd read: iowaitting...\n");
                 usleep(ASYNC_IOWAIT_TIME);
                 break;
 
             default:
-                bfdev_log_crit("async write: error %d\n", errno);
+                bfdev_log_crit("sdbd read: error %d\n", errno);
+                return -BFDEV_EIO;
+        }
+    } while (count < size);
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+sdbd_write(int fd, const void *data, size_t size)
+{
+    size_t count;
+    ssize_t rlen;
+
+    count = 0;
+    do {
+        rlen = write(fd, data, size - count);
+        if (rlen >= 0) {
+            count += rlen;
+            data += rlen;
+            continue;
+        }
+
+        switch (errno) {
+            case EINTR:
+                break;
+
+            case EAGAIN:
+                bfdev_log_debug("sdbd write: iowaitting...\n");
+                usleep(ASYNC_IOWAIT_TIME);
+                break;
+
+            default:
+                bfdev_log_warn("sdbd write: error %d\n", errno);
                 return -BFDEV_EIO;
         }
     } while (count < size);
@@ -541,7 +576,7 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
     struct sdbd_shell_service *shell;
 
     shell = bfdev_container_of(service, struct sdbd_shell_service, service);
-    return async_write(shell->event.fd, data, length);
+    return sdbd_write(shell->event.fd, data, length);
 }
 
 static void
@@ -744,9 +779,115 @@ done:
 }
 
 static int
+recursion_mkdir(char *dirname)
+{
+	char *curr;
+	int ret;
+
+	if (dirname[0] != '/')
+        return -1;
+    curr = dirname + 1;
+
+    for (;;) {
+		curr = strchr(curr, '/');
+		if (!curr)
+            break;
+
+		*curr = '\0';
+		ret = mkdir(dirname, 0755);
+		*curr++ = '/';
+
+		if ((ret < 0) && (errno != EEXIST)) {
+            bfdev_log_err("recursion mkdir: error %d\n", errno);
+			return -BFDEV_EACCES;
+		}
+	}
+
+	return 0;
+}
+
+static int
+sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
+{
+    struct sdbd_sync_service *sync;
+    struct sync_data *syncmsg;
+    uint32_t cmd, size;
+    int retval;
+
+    sync = bfdev_container_of(service, struct sdbd_sync_service, service);
+    bfdev_log_debug("sync send file write: inprogress %u\n", sync->inprogress);
+
+    while (length) {
+        if (sync->inprogress) {
+            size = bfdev_min(sync->inprogress, length);
+            bfdev_log_debug("sync send file write: write %d %u\n",
+                sync->fd, size);
+
+            length -= size;
+            sync->inprogress -= size;
+
+            if (sync->fd < 0)
+                return -BFDEV_ENOERR;
+
+            retval = sdbd_write(sync->fd, data, size);
+            if (retval < 0) {
+                sync->fd = -1;
+            }
+
+            continue;
+        }
+
+        syncmsg = data;
+        if (length < sizeof(*syncmsg))
+            return -BFDEV_EREMOTEIO;
+
+        cmd = bfdev_le32_to_cpu(syncmsg->id);
+        size = bfdev_le32_to_cpu(syncmsg->size);
+        bfdev_log_debug("sync send file write: cmd %c%c%c%c size %u\n",
+            (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
+            (cmd >> 24) & 0xff, size);
+
+        if (cmd != SYNC_CMD_DATA) {
+            bfdev_log_err("sync send file write: invalid data message");
+            return -BFDEV_EBADMSG;
+        }
+
+        if (size > SYNC_MAXDATA)
+            return -BFDEV_E2BIG;
+
+        length -= sizeof(*syncmsg);
+        sync->inprogress = size;
+    }
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode)
 {
-    return -BFDEV_EPROTONOSUPPORT;
+	sync->fd = open(filename, O_WRONLY | O_NONBLOCK | O_CREAT | O_EXCL, mode);
+	if (sync->fd < 0 && errno == ENOENT) {
+		recursion_mkdir(filename);
+
+        /* no directory, try again */
+		sync->fd = open(filename, O_WRONLY | O_NONBLOCK | O_CREAT | O_EXCL, mode);
+	}
+
+    if (sync->fd < 0 && errno == EEXIST) {
+        /* file exist, try again */
+		sync->fd = open(filename, O_WRONLY | O_NONBLOCK, mode);
+    }
+
+    if (sync->fd < 0) {
+        bfdev_log_err("sync send file: failed to open file %s error %d\n",
+            filename, errno);
+		return -BFDEV_EACCES;
+    }
+
+    bfdev_log_debug("sync send file: started %s mode %o\n", filename, mode);
+    sync->service.write = sync_send_file_write;
+
+    return -BFDEV_ENOERR;
 }
 
 static int
@@ -806,7 +947,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
     sync = pdata;
     retval = eventfd_read(event->fd, &count);
     if (retval < 0) {
-        bfdev_log_emerg("sync recv handled: eventfd error %d\n", errno);
+        bfdev_log_err("sync recv handled: eventfd error %d\n", errno);
         return -BFDEV_EIO;
     }
 
@@ -1156,20 +1297,23 @@ adb_usb_recv_handle(struct sdbd_ctx *sctx)
 
     /* check header */
     if (sctx->command != ~sctx->magic || sctx->length > MAX_PAYLOAD) {
-        bfdev_log_emerg("usb recv: packet header format error\n");
+        bfdev_log_err("usb recv: packet header format error\n");
         return -BFDEV_EBADMSG;
     }
 
     if (sctx->length) {
-        if (read(sctx->fd_out, payload, sctx->length) != sctx->length) {
-            bfdev_log_emerg("usb recv: failed to get payload\n");
+        bfdev_log_debug("usb recv: read payload %u\n", sctx->length);
+
+        retval = sdbd_read(sctx->fd_out, payload, sctx->length);
+        if (retval < 0) {
+            bfdev_log_err("usb recv: failed to get payload %d\n", errno);
             return -BFDEV_EBADMSG;
         }
-    }
 
-    if (payload_cksum(payload, sctx->length) != sctx->check) {
-        bfdev_log_emerg("usb recv: payload cksum error\n");
-        return -BFDEV_EREMOTEIO;
+        if (payload_cksum(payload, sctx->length) != sctx->check) {
+            bfdev_log_err("usb recv: payload cksum error\n");
+            return -BFDEV_EREMOTEIO;
+        }
     }
 
     payload[sctx->length] = '\0';
@@ -1199,7 +1343,7 @@ sdbd_usb_out_handle(bfenv_eproc_event_t *event, void *pdata)
     sctx = pdata;
     retval = eventfd_read(event->fd, &count);
     if (retval < 0) {
-        bfdev_log_emerg("usb out handled: eventfd error %d\n", errno);
+        bfdev_log_err("usb out handled: eventfd error %d\n", errno);
         return -BFDEV_EIO;
     }
 
@@ -1241,7 +1385,7 @@ sdbd_usb_in_handle(bfenv_eproc_event_t *event, void *pdata)
     sctx = pdata;
     retval = eventfd_read(event->fd, &count);
     if (retval < 0) {
-        bfdev_log_emerg("usb in handled: eventfd error %d\n", errno);
+        bfdev_log_err("usb in handled: eventfd error %d\n", errno);
         return -BFDEV_EIO;
     }
 
@@ -1281,7 +1425,7 @@ sdbd_signal_handle(bfenv_eproc_event_t *event, void *pdata)
 
     retval = read(event->fd, &si, sizeof(si));
     if (retval < 0) {
-        bfdev_log_emerg("signal handled: sigfd error %d\n", errno);
+        bfdev_log_err("signal handled: sigfd error %d\n", errno);
         return -BFDEV_EIO;
     }
 
