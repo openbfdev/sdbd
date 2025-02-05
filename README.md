@@ -15,7 +15,7 @@
 - [x] Shell command
 - [x] Reboot command
 - [x] Remount command
-- [ ] File sync commands (push pull)
+- [x] File sync commands (push pull)
 
 ### Support commands
 
@@ -24,6 +24,23 @@ $ adb shell [args] ... # interactive shell
 $ adb reboot [args] ... # reboot device
 $ adb remount # remount /system
 ```
+
+## Benchmark Test
+
+sdbd speed:
+
+![sdbd-speed](./docs/sdbd-speed.png)
+
+adbd speed:
+
+![adbd-speed](./docs/adbd-speed.png)
+
+**SDBD is five times the speed of ADBD.**
+
+## Reference Link
+
+- [xdbd](https://github.com/openbfdev/xdbd): https://github.com/openbfdev/xdbd
+- [adbd](https://github.com/BigfootACA/adbd): https://github.com/BigfootACA/adbd
 
 ## License
 
