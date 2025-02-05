@@ -1221,6 +1221,35 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
     return -BFDEV_ENOERR;
 }
 
+static int
+service_write(struct sdbd_ctx *sctx, uint8_t *payload)
+{
+    struct sdbd_service *service, **psrv;
+    uint32_t local, remote;
+    int retval;
+
+    local = sctx->args[1];
+    psrv = bfdev_radix_find(&sctx->services, local);
+    if (!psrv) {
+        bfdev_log_err("service write: failed connect to %d\n", local);
+        return -BFDEV_ENOERR;
+    }
+
+    service = *psrv;
+    remote = service->remote;
+
+    /* service could close in write */
+    retval = service->write(service, payload, sctx->length);
+    if (retval)
+        return retval;
+
+    retval = send_okay(sctx, local, remote);
+    if (retval)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
 static void
 service_close(struct sdbd_ctx *sctx)
 {
@@ -1238,30 +1267,17 @@ service_close(struct sdbd_ctx *sctx)
     service->close(service);
 }
 
-static int
-service_write(struct sdbd_ctx *sctx, uint8_t *payload)
+static void
+service_close_all(struct sdbd_ctx *sctx)
 {
     struct sdbd_service *service, **psrv;
-    uint32_t local;
-    int retval;
+    uintptr_t offset;
 
-    local = sctx->args[1];
-    psrv = bfdev_radix_find(&sctx->services, local);
-    if (!psrv) {
-        bfdev_log_err("service write: failed connect to %d\n", local);
-        return -BFDEV_ENOERR;
+    bfdev_log_debug("service close all\n");
+    bfdev_radix_for_each(psrv, &sctx->services, &offset) {
+        service = *psrv;
+        service->close(service);
     }
-    service = *psrv;
-
-    retval = service->write(service, payload, sctx->length);
-    if (retval)
-        return retval;
-
-    retval = send_okay(sctx, service->local, service->remote);
-    if (retval)
-        return retval;
-
-    return -BFDEV_ENOERR;
 }
 
 static int
@@ -1466,6 +1482,9 @@ sdbd_signal_handle(bfenv_eproc_event_t *event, void *pdata)
             waitpid(-1, NULL, 0);
             break;
 
+        case SIGINT:
+            return -BFDEV_ECANCELED;
+
         default:
             BFDEV_BUG();
     }
@@ -1516,26 +1535,6 @@ usb_init(struct sdbd_ctx *sctx)
         return -BFDEV_EACCES;
     }
 
-    sctx->usbev_out.fd = sctx->usbio_out->eventfd;
-    sctx->usbev_out.flags = BFENV_EPROC_READ;
-    sctx->usbev_out.priority = -100;
-    sctx->usbev_out.func = sdbd_usb_out_handle;
-    sctx->usbev_out.pdata = sctx;
-
-    sctx->usbev_in.fd = sctx->usbio_in->eventfd;
-    sctx->usbev_in.flags = BFENV_EPROC_READ;
-    sctx->usbev_in.priority = -100;
-    sctx->usbev_in.func = sdbd_usb_in_handle;
-    sctx->usbev_in.pdata = sctx;
-
-    retval = bfenv_eproc_event_add(sctx->eproc, &sctx->usbev_out);
-    if (retval)
-        return retval;
-
-    retval = bfenv_eproc_event_add(sctx->eproc, &sctx->usbev_in);
-    if (retval)
-        return retval;
-
     bfdev_log_debug("usbio read: message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
         &sctx->msgbuff, sizeof(sctx->msgbuff));
@@ -1545,24 +1544,30 @@ usb_init(struct sdbd_ctx *sctx)
     return -BFDEV_ENOERR;
 }
 
+static void
+usb_close(struct sdbd_ctx *sctx)
+{
+    close(sctx->fd_ctr);
+    close(sctx->fd_out);
+    close(sctx->fd_in);
+}
+
 static int
 usb_kick(struct sdbd_ctx *sctx)
 {
     int retval;
 
-    bfenv_eproc_event_remove(sctx->eproc, &sctx->usbev_out);
-    bfenv_eproc_event_remove(sctx->eproc, &sctx->usbev_in);
-
+    bfdev_log_debug("usb kick\n");
     if ((retval = ioctl(sctx->fd_out, FUNCTIONFS_CLEAR_HALT)) ||
         (retval = ioctl(sctx->fd_in, FUNCTIONFS_CLEAR_HALT)))
         return -BFDEV_EIO;
 
-    close(sctx->fd_ctr);
-    close(sctx->fd_out);
-    close(sctx->fd_in);
+    usb_close(sctx);
+    retval = usb_init(sctx);
+    if (retval)
+        return retval;
 
-    bfdev_log_debug("usb kick\n");
-    return usb_init(sctx);
+    return -BFDEV_ENOERR;
 }
 
 static int
@@ -1572,6 +1577,7 @@ signal_init(struct sdbd_ctx *sctx)
     int sigfd, retval;
 
     sigemptyset(&mask);
+    sigaddset(&mask, SIGINT);
     sigaddset(&mask, SIGCHLD);
 
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
@@ -1641,6 +1647,30 @@ sdbd(void)
         goto error;
     }
 
+    sctx.usbev_out.fd = sctx.usbio_out->eventfd;
+    sctx.usbev_out.flags = BFENV_EPROC_READ;
+    sctx.usbev_out.priority = -100;
+    sctx.usbev_out.func = sdbd_usb_out_handle;
+    sctx.usbev_out.pdata = &sctx;
+
+    sctx.usbev_in.fd = sctx.usbio_in->eventfd;
+    sctx.usbev_in.flags = BFENV_EPROC_READ;
+    sctx.usbev_in.priority = -100;
+    sctx.usbev_in.func = sdbd_usb_in_handle;
+    sctx.usbev_in.pdata = &sctx;
+
+    retval = bfenv_eproc_event_add(sctx.eproc, &sctx.usbev_out);
+    if (retval) {
+        bfdev_log_err("register usb out event failed\n");
+        goto error;
+    }
+
+    retval = bfenv_eproc_event_add(sctx.eproc, &sctx.usbev_in);
+    if (retval) {
+        bfdev_log_err("register usb in event failed\n");
+        goto error;
+    }
+
     retval = usb_init(&sctx);
     if (retval) {
         bfdev_log_err("usb initialization failed\n");
@@ -1656,21 +1686,37 @@ sdbd(void)
         switch (retval) {
             case -BFDEV_ESHUTDOWN:
                 bfdev_log_notice("usb disconnected\n");
+                service_close_all(&sctx);
                 retval = usb_kick(&sctx);
                 if (retval)
                     goto error;
                 break;
+
+            case -BFDEV_ECANCELED:
+                goto finish;
 
             default:
                 goto error;
         }
     }
 
-    return -BFDEV_ENOERR;
+finish:
+    service_close_all(&sctx);
+    bfdev_radix_release(&sctx.services);
+
+    usb_close(&sctx);
+    bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_out);
+    bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_in);
+    bfenv_iothread_destory(sctx.usbio_out);
+    bfenv_iothread_destory(sctx.usbio_in);
+    bfenv_eproc_destory(sctx.eproc);
+    bfdev_log_debug("finish exit\n");
+
+    return 0;
 
 error:
     bfdev_log_emerg("failure exit\n");
-    exit(1);
+    return 1;
 }
 
 static int
