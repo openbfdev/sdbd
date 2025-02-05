@@ -368,26 +368,18 @@ sdbd_write(int fd, const void *data, size_t size)
 }
 
 static int
-async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
+async_usb_issue(struct sdbd_ctx *sctx, const void *data, size_t size)
 {
-    void *buff;
     int retval;
 
-    /* iothread is zero copy */
-    buff = bfdev_malloc(NULL, size);
-    if (!buff)
-        return -BFDEV_ENOMEM;
-    memcpy(buff, data, size);
-
     for (;;) {
-        retval = bfenv_iothread_write(sctx->usbio_in,
-            sctx->fd_in, buff, size);
+        retval = bfenv_iothread_write(sctx->usbio_in, sctx->fd_in, data, size);
         if (retval >= 0)
             break;
 
         switch (retval) {
             case -BFDEV_EAGAIN:
-                bfdev_log_debug("async usb write: iowaitting...\n");
+                bfdev_log_debug("async usb write: iowaitting...\n");\
                 usleep(ASYNC_IOWAIT_TIME);
                 break;
 
@@ -396,6 +388,24 @@ async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
                 return -BFDEV_EIO;
         }
     }
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
+{
+    void *buff;
+    int retval;
+
+    buff = bfdev_malloc(NULL, size);
+    if (!buff)
+        return -BFDEV_ENOMEM;
+
+    memcpy(buff, data, size);
+    retval = async_usb_issue(sctx, buff, size);
+    if (retval)
+        return retval;
 
     return -BFDEV_ENOERR;
 }
