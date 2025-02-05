@@ -670,6 +670,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     int amaster, retval;
     pid_t pid;
 
+    bfdev_log_notice("shell open: cmdline %s\n", cmdline);
     pid = spawn_shell(&amaster, sdbd_shell, cmdline);
     if (pid < 0)
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
