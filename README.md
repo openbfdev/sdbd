@@ -23,6 +23,8 @@
 $ adb shell [args] ... # interactive shell
 $ adb reboot [args] ... # reboot device
 $ adb remount # remount /system
+$ adb push local-path remote-path # push files to device
+$ adb pull remote-path local-path # pull files from device
 ```
 
 ## Benchmark Test
