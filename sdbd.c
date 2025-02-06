@@ -76,7 +76,6 @@
 
 /* SDBD Configuration */
 #define USB_FIFO_DEEPTH 64
-#define SYNC_FIFO_DEEPTH 256
 #define SERVICE_TIMEOUT (12 * 60 * 60 * 1000)
 #define ASYNC_IOWAIT_TIME 1000
 
@@ -718,19 +717,26 @@ service_remount_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static void
-service_sync_close(struct sdbd_service *service)
+service_sync_release(struct sdbd_sync_service *sync)
 {
-    struct sdbd_sync_service *sync;
-
-    sync = bfdev_container_of(service, struct sdbd_sync_service, service);
     if (sync->fileio) {
         bfenv_eproc_event_remove(sync->service.sctx->eproc, &sync->event);
         bfenv_iothread_destory(sync->fileio);
     }
 
+    sync->fileio = NULL;
     close(sync->fd);
+}
+
+static void
+service_sync_close(struct sdbd_service *service)
+{
+    struct sdbd_sync_service *sync;
+
+    sync = bfdev_container_of(service, struct sdbd_sync_service, service);
     bfdev_radix_free(&service->sctx->services, service->local);
-    bfdev_free(NULL, service);
+    service_sync_release(sync);
+    bfdev_free(NULL, sync);
 }
 
 static int
@@ -907,12 +913,14 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
 static int
 sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode)
 {
-	sync->fd = open(filename, O_WRONLY | O_NONBLOCK | O_CREAT | O_EXCL, mode);
+	sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
+        O_CREAT | O_EXCL, mode);
 	if (sync->fd < 0 && errno == ENOENT) {
 		recursion_mkdir(filename);
 
         /* no directory, try again */
-		sync->fd = open(filename, O_WRONLY | O_NONBLOCK | O_CREAT | O_EXCL, mode);
+		sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
+            O_CREAT | O_EXCL, mode);
 	}
 
     if (sync->fd < 0 && errno == EEXIST) {
@@ -1026,6 +1034,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         if (retval)
             return retval;
 
+        service_sync_release(sync);
         return -BFDEV_ENOERR;
     }
 
@@ -1056,13 +1065,17 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
     int retval;
 
     sync->fd = open(filename, O_RDONLY);
-    if (sync->fd < 0)
+    if (sync->fd < 0) {
+        bfdev_log_err("sync recv: failed to open file %s error %d\n",
+            filename, errno);
         return -BFDEV_EACCES;
+    }
 
-    sync->fileio = bfenv_iothread_create(NULL, SYNC_FIFO_DEEPTH,
-        BFENV_IOTHREAD_FLAGS_SIGREAD);
-    if (!sync->fileio)
+    sync->fileio = bfenv_iothread_create(NULL, 1, BFENV_IOTHREAD_FLAGS_SIGREAD);
+    if (!sync->fileio) {
+        bfdev_log_err("sync recv: failed to create iothread error\n");
         return -BFDEV_EFAULT;
+    }
 
     sync->event.fd = sync->fileio->eventfd;
     sync->event.flags = BFENV_EPROC_READ;
@@ -1070,8 +1083,10 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
     sync->event.pdata = sync;
 
     retval = bfenv_eproc_event_add(sync->service.sctx->eproc, &sync->event);
-    if (retval < 0)
+    if (retval < 0) {
+        bfdev_log_err("sync recv: failed to add event error\n");
         return retval;
+    }
 
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
         &sync->buff, sizeof(sync->buff));
@@ -1644,7 +1659,7 @@ sdbd(void)
         goto error;
     }
 
-    sctx.usbio_out = bfenv_iothread_create(NULL, USB_FIFO_DEEPTH,
+    sctx.usbio_out = bfenv_iothread_create(NULL, 1,
         BFENV_IOTHREAD_FLAGS_SIGREAD);
     if (!sctx.usbio_out) {
         bfdev_log_err("usbio out iothread create failed\n");
