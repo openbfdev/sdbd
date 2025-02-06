@@ -76,6 +76,7 @@
 
 /* SDBD Configuration */
 #define USB_FIFO_DEEPTH 64
+#define SYNC_FIFO_DEEPTH 32
 #define SERVICE_TIMEOUT (12 * 60 * 60 * 1000)
 #define ASYNC_IOWAIT_TIME 1000
 
@@ -403,7 +404,7 @@ async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
 
     memcpy(buff, data, size);
     retval = async_usb_issue(sctx, buff, size);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -424,13 +425,13 @@ write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet)
 
     bfdev_log_debug("usbio write: message\n");
     retval = async_usb_write(sctx, &message, sizeof(message));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     if (packet->length) {
         bfdev_log_debug("usbio write: payload\n");
         retval = async_usb_write(sctx, packet->payload, packet->length);
-        if (retval)
+        if (retval < 0)
             return retval;
     }
 
@@ -556,7 +557,7 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, s
         local, remote, size);
     for (; (xfer = bfdev_min(size, MAX_PAYLOAD)); size -= xfer) {
         retval = send_data(sctx, local, remote, data, xfer);
-        if (retval)
+        if (retval < 0)
             return retval;
         data += xfer;
     }
@@ -578,19 +579,19 @@ spawn_shell(int *amaster, const char *path, char *cmdline)
     value = getenv("TERM");
     if (!value) {
         retval = setenv("TERM", "xterm-256color", 0);
-        if (retval)
+        if (retval < 0)
             exit(retval);
     }
 
     value = getenv("HOME");
     if (value) {
         retval = chdir(value);
-        if (retval)
+        if (retval < 0)
             exit(retval);
     }
 
     retval = execl(path, path, cmdline ? "-c" : NULL, cmdline, NULL);
-    if (retval)
+    if (retval < 0)
         exit(retval);
 
     /* should never come here */
@@ -717,25 +718,18 @@ service_remount_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static void
-service_sync_release(struct sdbd_sync_service *sync)
-{
-    if (sync->fileio) {
-        bfenv_eproc_event_remove(sync->service.sctx->eproc, &sync->event);
-        bfenv_iothread_destory(sync->fileio);
-    }
-
-    sync->fileio = NULL;
-    close(sync->fd);
-}
-
-static void
 service_sync_close(struct sdbd_service *service)
 {
     struct sdbd_sync_service *sync;
 
     sync = bfdev_container_of(service, struct sdbd_sync_service, service);
+    if (sync->fd > 0)
+        close(sync->fd);
+
+    bfenv_eproc_event_remove(sync->service.sctx->eproc, &sync->event);
+    bfenv_iothread_destory(sync->fileio);
+
     bfdev_radix_free(&service->sctx->services, service->local);
-    service_sync_release(sync);
     bfdev_free(NULL, sync);
 }
 
@@ -757,7 +751,7 @@ service_sync_stat(struct sdbd_sync_service *sync, char *filename)
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -799,12 +793,12 @@ service_sync_list(struct sdbd_sync_service *sync, char *filename)
 
             retval = send_data(sync->service.sctx, sync->service.local,
                 sync->service.remote, &syncmsg, sizeof(syncmsg));
-            if (retval)
+            if (retval < 0)
                 return retval;
 
             retval = send_data(sync->service.sctx, sync->service.local,
                 sync->service.remote, dirent->d_name, filelen);
-            if (retval)
+            if (retval < 0)
                 return retval;
 		}
 	}
@@ -820,7 +814,7 @@ done:
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -969,7 +963,7 @@ service_sync_send(struct sdbd_sync_service *sync, char *filename)
 
 	if (islink) {
         retval = sync_send_link(sync, filename);
-        if (retval)
+        if (retval < 0)
             return retval;
         return -BFDEV_ENOERR;
     }
@@ -978,7 +972,7 @@ service_sync_send(struct sdbd_sync_service *sync, char *filename)
     mode |= (mode >> 3) & 0007;
 
     retval = sync_send_file(sync, filename, mode);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1031,10 +1025,12 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         bfdev_log_info("shell recv handled: finish\n");
         retval = send_data(sync->service.sctx, sync->service.local,
             sync->service.remote, &syncmsg, sizeof(syncmsg));
-        if (retval)
+        if (retval < 0)
             return retval;
 
-        service_sync_release(sync);
+        close(sync->fd);
+        sync->fd = -1;
+
         return -BFDEV_ENOERR;
     }
 
@@ -1043,17 +1039,17 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     retval = send_datas(sync->service.sctx, sync->service.local,
         sync->service.remote, request.buffer, request.size);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
         &sync->buff, sizeof(sync->buff));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1071,26 +1067,10 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
         return -BFDEV_EACCES;
     }
 
-    sync->fileio = bfenv_iothread_create(NULL, 1, BFENV_IOTHREAD_FLAGS_SIGREAD);
-    if (!sync->fileio) {
-        bfdev_log_err("sync recv: failed to create iothread error\n");
-        return -BFDEV_EFAULT;
-    }
-
-    sync->event.fd = sync->fileio->eventfd;
-    sync->event.flags = BFENV_EPROC_READ;
     sync->event.func = service_sync_recv_handle;
-    sync->event.pdata = sync;
-
-    retval = bfenv_eproc_event_add(sync->service.sctx->eproc, &sync->event);
-    if (retval < 0) {
-        bfdev_log_err("sync recv: failed to add event error\n");
-        return retval;
-    }
-
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
         &sync->buff, sizeof(sync->buff));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1135,25 +1115,25 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     switch (cmd) {
         case SYNC_CMD_STAT:
             retval = service_sync_stat(sync, filename);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
 
         case SYNC_CMD_LIST:
             retval = service_sync_list(sync, filename);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
 
         case SYNC_CMD_SEND:
             retval = service_sync_send(sync, filename);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
 
         case SYNC_CMD_RECV:
             retval = service_sync_recv(sync, filename);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
 
@@ -1171,6 +1151,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_sync_service *sync;
     struct sdbd_service **psrv;
+    int retval;
 
     sync = bfdev_zalloc(NULL, sizeof(*sync));
     if (!sync)
@@ -1181,6 +1162,23 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     sync->service.local = ++sctx->sockid;
     sync->service.write = service_sync_write;
     sync->service.close = service_sync_close;
+
+    sync->fileio = bfenv_iothread_create(NULL, SYNC_FIFO_DEEPTH,
+        BFENV_IOTHREAD_SIGREAD);
+    if (!sync->fileio) {
+        bfdev_log_err("sync open: failed to create iothread\n");
+        return NULL;
+    }
+
+    sync->event.fd = sync->fileio->eventfd;
+    sync->event.flags = BFENV_EPROC_READ;
+    sync->event.pdata = sync;
+
+    retval = bfenv_eproc_event_add(sync->service.sctx->eproc, &sync->event);
+    if (retval < 0) {
+        bfdev_log_err("sync open: failed to add event\n");
+        return NULL;
+    }
 
     psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
     if (!psrv)
@@ -1241,7 +1239,7 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
 
     bfdev_log_warn("service open: unsupported service\n");
     retval = send_close(sctx, 0, sctx->args[0]);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1266,11 +1264,11 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
 
     /* service could close in write */
     retval = service->write(service, payload, sctx->length);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     retval = send_okay(sctx, local, remote);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1319,14 +1317,14 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
     switch (cmd) {
         case PCMD_CNXN:
             retval = send_connect(sctx);
-            if (retval)
+            if (retval < 0)
                 return retval;
             bfdev_log_notice("usb connected\n");
             break;
 
         case PCMD_OPEN:
             retval = service_open(sctx, (void *)payload);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
 
@@ -1336,7 +1334,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 
         case PCMD_WRTE:
             retval = service_write(sctx, payload);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
 
@@ -1347,7 +1345,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
         default:
             bfdev_log_warn("handled packet: unsupported command\n");
             retval = send_close(sctx, 0, sctx->args[0]);
-            if (retval)
+            if (retval < 0)
                 return retval;
             break;
     }
@@ -1391,14 +1389,14 @@ adb_usb_recv_handle(struct sdbd_ctx *sctx)
 
     payload[sctx->length] = '\0';
     retval = handle_packet(sctx, sctx->command, payload);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     /* reregister usbio read handler */
     bfdev_log_debug("usbio read: message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
         &sctx->msgbuff, sizeof(sctx->msgbuff));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1546,7 +1544,7 @@ usb_init(struct sdbd_ctx *sctx)
     }
 
     retval = usb_init_send(sctx->fd_ctr);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     sctx->fd_out = open(USB_FFS_ADB_OUT, O_RDONLY);
@@ -1564,7 +1562,7 @@ usb_init(struct sdbd_ctx *sctx)
     bfdev_log_debug("usbio read: message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
         &sctx->msgbuff, sizeof(sctx->msgbuff));
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1590,7 +1588,7 @@ usb_kick(struct sdbd_ctx *sctx)
 
     usb_close(sctx);
     retval = usb_init(sctx);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1620,7 +1618,7 @@ signal_init(struct sdbd_ctx *sctx)
     sctx->sigev.pdata = sctx;
 
     retval = bfenv_eproc_event_add(sctx->eproc, &sctx->sigev);
-    if (retval)
+    if (retval < 0)
         return retval;
 
     return -BFDEV_ENOERR;
@@ -1654,20 +1652,20 @@ sdbd(void)
     }
 
     retval = signal_init(&sctx);
-    if (retval) {
+    if (retval < 0) {
         bfdev_log_err("signal initialization failed\n");
         goto error;
     }
 
     sctx.usbio_out = bfenv_iothread_create(NULL, 1,
-        BFENV_IOTHREAD_FLAGS_SIGREAD);
+        BFENV_IOTHREAD_SIGREAD);
     if (!sctx.usbio_out) {
         bfdev_log_err("usbio out iothread create failed\n");
         goto error;
     }
 
     sctx.usbio_in = bfenv_iothread_create(NULL, USB_FIFO_DEEPTH,
-        BFENV_IOTHREAD_FLAGS_SIGWRITE);
+        BFENV_IOTHREAD_SIGWRITE);
     if (!sctx.usbio_in) {
         bfdev_log_err("usbio in iothread create failed\n");
         goto error;
@@ -1686,19 +1684,19 @@ sdbd(void)
     sctx.usbev_in.pdata = &sctx;
 
     retval = bfenv_eproc_event_add(sctx.eproc, &sctx.usbev_out);
-    if (retval) {
+    if (retval < 0) {
         bfdev_log_err("register usb out event failed\n");
         goto error;
     }
 
     retval = bfenv_eproc_event_add(sctx.eproc, &sctx.usbev_in);
-    if (retval) {
+    if (retval < 0) {
         bfdev_log_err("register usb in event failed\n");
         goto error;
     }
 
     retval = usb_init(&sctx);
-    if (retval) {
+    if (retval < 0) {
         bfdev_log_err("usb initialization failed\n");
         goto error;
     }
@@ -1714,7 +1712,7 @@ sdbd(void)
                 bfdev_log_notice("usb disconnected\n");
                 service_close_all(&sctx);
                 retval = usb_kick(&sctx);
-                if (retval)
+                if (retval < 0)
                     goto error;
                 break;
 
@@ -1864,7 +1862,7 @@ main(int argc, char *const argv[])
 
     if (sdbd_daemon) {
         retval = spawn_daemon();
-        if (retval)
+        if (retval < 0)
             return retval;
     }
 
