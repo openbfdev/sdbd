@@ -1,8 +1,3 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
-/*
- * Copyright(c) 2025 John Sanpe <sanpeqf@gmail.com>
- */
-
 #include <stdint.h>
 #include <unistd.h>
 #include <getopt.h>
@@ -72,6 +67,8 @@
 #define SYNC_CMD_DATA 0x41544144
 #define SYNC_CMD_DENT 0x544e4544
 #define SYNC_CMD_DONE 0x454e4f44
+#define SYNC_CMD_OKAY 0x59414b4f
+#define SYNC_CMD_FAIL 0x4c494146
 #define SYNC_CMD_QUIT 0x54495551
 
 /* SDBD Configuration */
@@ -255,6 +252,7 @@ struct sdbd_packet {
 
 struct sdbd_service {
     struct sdbd_ctx *sctx;
+    bfdev_array_t stream;
     int (*write)(struct sdbd_service *service, void *data, size_t length);
     void (*close)(struct sdbd_service *service);
 
@@ -598,6 +596,29 @@ spawn_shell(int *amaster, const char *path, char *cmdline)
     BFDEV_BUG();
 }
 
+static ssize_t
+stream_accumulate(struct sdbd_service *service, size_t request, void *data, size_t append)
+{
+    size_t alreary, remain, avail;
+    void *buff;
+
+    alreary = bfdev_array_size(&service->stream);
+    BFDEV_BUG_ON(alreary > request);
+
+    remain = request - alreary;
+    avail = bfdev_min(remain, append);
+
+    buff = bfdev_array_push(&service->stream, avail);
+    if (!buff)
+        return -BFDEV_ENOMEM;
+
+    memcpy(buff, data, avail);
+    if (append < remain)
+        return -BFDEV_EAGAIN;
+
+    return avail;
+}
+
 static void
 service_shell_release(struct sdbd_service *service)
 {
@@ -671,9 +692,6 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     pid_t pid;
 
     bfdev_log_notice("shell open: cmdline %s\n", cmdline);
-    pid = spawn_shell(&amaster, sdbd_shell, cmdline);
-    if (pid < 0)
-        return BFDEV_ERR_PTR(-BFDEV_EFAULT);
 
     shell = bfdev_zalloc(NULL, sizeof(*shell));
     if (!shell)
@@ -684,13 +702,13 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     shell->service.local = ++sctx->sockid;
     shell->service.write = service_shell_write;
     shell->service.close = service_shell_close;
+    bfdev_array_init(&shell->service.stream, NULL, sizeof(uint8_t));
+
+    pid = spawn_shell(&amaster, sdbd_shell, cmdline);
+    if (pid < 0)
+        return BFDEV_ERR_PTR(-BFDEV_EFAULT);
+
     shell->pid = pid;
-
-    psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
-    if (!psrv)
-        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
-    *psrv = &shell->service;
-
     shell->event.fd = amaster;
     shell->event.flags = BFENV_EPROC_READ;
     shell->event.func = service_shell_handle;
@@ -699,6 +717,11 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     retval = bfenv_eproc_event_add(sctx->eproc, &shell->event);
     if (retval < 0)
         return BFDEV_ERR_PTR(retval);
+
+    psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
+    if (!psrv)
+        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+    *psrv = &shell->service;
 
     return &shell->service;
 }
@@ -734,20 +757,54 @@ service_sync_close(struct sdbd_service *service)
 }
 
 static int
+service_sync_status(struct sdbd_sync_service *sync, uint32_t cmd, char *msg)
+{
+    struct sync_status syncmsg;
+    int retval;
+
+    syncmsg.id = bfdev_cpu_to_le32(cmd);
+    syncmsg.msglen = bfdev_cpu_to_le32(strlen(msg));
+
+    retval = send_data(sync->service.sctx, sync->service.local,
+        sync->service.remote, &syncmsg, sizeof(syncmsg));
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_sync_fail(struct sdbd_sync_service *sync, char *msg)
+{
+    int retval;
+
+    retval = service_sync_status(sync, SYNC_CMD_FAIL, msg);
+    if (retval < 0)
+        return retval;
+
+    retval = send_close(sync->service.sctx, 0, sync->service.remote);
+    if (retval < 0)
+        return retval;
+
+    service_sync_close(&sync->service);
+    return -BFDEV_ENOERR;
+}
+
+static int
 service_sync_stat(struct sdbd_sync_service *sync, char *filename)
 {
     struct sync_stat syncmsg;
-	struct stat stat;
+    struct stat stat;
     int retval;
 
     bzero(&syncmsg, sizeof(syncmsg));
-	syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_STAT);
+    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_STAT);
 
-	if (!lstat(filename, &stat)) {
-		syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
-		syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
-		syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
-	}
+    if (!lstat(filename, &stat)) {
+        syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
+        syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
+        syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
+    }
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
@@ -760,36 +817,36 @@ service_sync_stat(struct sdbd_sync_service *sync, char *filename)
 static int
 service_sync_list(struct sdbd_sync_service *sync, char *filename)
 {
-	char buffer[PATH_MAX + 1], *fname;
+    char buffer[PATH_MAX + 1], *fname;
     struct sync_directry syncmsg;
-	struct stat stat;
-	size_t pathlen, filelen;
-	struct dirent *dirent;
+    struct stat stat;
+    size_t pathlen, filelen;
+    struct dirent *dirent;
     int retval;
-	DIR *dir;
+    DIR *dir;
 
-	pathlen = strlen(filename);
+    pathlen = strlen(filename);
     BFDEV_BUG_ON(pathlen + 1 > PATH_MAX);
 
-	memcpy(buffer, filename, pathlen);
-	buffer[pathlen++] = '/';
-	fname = buffer + pathlen;
+    memcpy(buffer, filename, pathlen);
+    buffer[pathlen++] = '/';
+    fname = buffer + pathlen;
 
-	dir = opendir(filename);
-	if (!dir)
+    dir = opendir(filename);
+    if (!dir)
         goto done;
 
-	syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DENT);
-	while ((dirent = readdir(dir))) {
-		filelen = strlen(dirent->d_name);
+    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DENT);
+    while ((dirent = readdir(dir))) {
+        filelen = strlen(dirent->d_name);
         BFDEV_BUG_ON(pathlen + filelen > PATH_MAX);
 
-		strcpy(fname, dirent->d_name);
-		if (!lstat(buffer, &stat)) {
-			syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
-			syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
-			syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
-			syncmsg.namelen = bfdev_cpu_to_le32(filelen);
+        strcpy(fname, dirent->d_name);
+        if (!lstat(buffer, &stat)) {
+            syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
+            syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
+            syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
+            syncmsg.namelen = bfdev_cpu_to_le32(filelen);
 
             retval = send_data(sync->service.sctx, sync->service.local,
                 sync->service.remote, &syncmsg, sizeof(syncmsg));
@@ -800,17 +857,17 @@ service_sync_list(struct sdbd_sync_service *sync, char *filename)
                 sync->service.remote, dirent->d_name, filelen);
             if (retval < 0)
                 return retval;
-		}
-	}
+        }
+    }
 
-	closedir(dir);
+    closedir(dir);
 
 done:
-	syncmsg.id = SYNC_CMD_DONE;
-	syncmsg.mode = 0;
-	syncmsg.size = 0;
-	syncmsg.time = 0;
-	syncmsg.namelen = 0;
+    syncmsg.id = SYNC_CMD_DONE;
+    syncmsg.mode = 0;
+    syncmsg.size = 0;
+    syncmsg.time = 0;
+    syncmsg.namelen = 0;
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
@@ -823,30 +880,33 @@ done:
 static int
 recursion_mkdir(char *dirname)
 {
-	char *curr;
-	int ret;
+    char *curr;
+    int ret;
 
-	if (dirname[0] != '/')
+    if (dirname[0] != '/')
         return -1;
     curr = dirname + 1;
 
     for (;;) {
-		curr = strchr(curr, '/');
-		if (!curr)
+        curr = strchr(curr, '/');
+        if (!curr)
             break;
 
-		*curr = '\0';
-		ret = mkdir(dirname, 0755);
-		*curr++ = '/';
+        *curr = '\0';
+        ret = mkdir(dirname, 0755);
+        *curr++ = '/';
 
-		if ((ret < 0) && (errno != EEXIST)) {
+        if ((ret < 0) && (errno != EEXIST)) {
             bfdev_log_err("recursion mkdir: error %d\n", errno);
-			return -BFDEV_EACCES;
-		}
-	}
+            return -BFDEV_EACCES;
+        }
+    }
 
-	return 0;
+    return 0;
 }
+
+static int
+service_sync_write(struct sdbd_service *service, void *data, size_t length);
 
 static int
 sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
@@ -854,6 +914,7 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
     struct sdbd_sync_service *sync;
     struct sync_data *syncmsg;
     uint32_t cmd, size;
+    ssize_t retlen;
     int retval;
 
     sync = bfdev_container_of(service, struct sdbd_sync_service, service);
@@ -865,39 +926,71 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
             bfdev_log_debug("sync send file write: write %d %u\n",
                 sync->fd, size);
 
-            length -= size;
-            sync->inprogress -= size;
-
-            if (sync->fd < 0)
-                return -BFDEV_ENOERR;
-
-            retval = sdbd_write(sync->fd, data, size);
-            if (retval < 0) {
-                sync->fd = -1;
+            if (sync->fd > 0) {
+                retval = sdbd_write(sync->fd, data, size);
+                if (retval < 0) {
+                    close(sync->fd);
+                    sync->fd = -1;
+                }
             }
+
+            length -= size;
+            data += size;
+            sync->inprogress -= size;
 
             continue;
         }
 
-        syncmsg = data;
-        if (length < sizeof(*syncmsg))
-            return -BFDEV_EREMOTEIO;
+        retlen = stream_accumulate(&sync->service, sizeof(*syncmsg), data, length);
+        if (retlen < 0) {
+            if (retlen == -BFDEV_EAGAIN) {
+                bfdev_log_debug("sync send file write: wait header\n");
+                return -BFDEV_ENOERR;
+            }
+            bfdev_log_debug("sync send file write: wait failed\n");
+            return retlen;
+        }
 
+        syncmsg = bfdev_array_data(&sync->service.stream, 0);
         cmd = bfdev_le32_to_cpu(syncmsg->id);
         size = bfdev_le32_to_cpu(syncmsg->size);
+        bfdev_array_reset(&sync->service.stream);
+
         bfdev_log_debug("sync send file write: cmd %c%c%c%c size %u\n",
             (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
             (cmd >> 24) & 0xff, size);
 
-        if (cmd != SYNC_CMD_DATA) {
-            bfdev_log_err("sync send file write: invalid data message");
-            return -BFDEV_EBADMSG;
+        switch (cmd) {
+            case SYNC_CMD_DATA:
+                break;
+
+            case SYNC_CMD_DONE:
+                sync->service.write = service_sync_write;
+                if (sync->fd > 0) {
+                    close(sync->fd);
+                    sync->fd = -1;
+                }
+
+                retval = service_sync_status(sync, SYNC_CMD_OKAY, "");
+                if (retval < 0)
+                    return retval;
+
+                return -BFDEV_ENOERR;
+
+            default:
+                sync->service.write = service_sync_write;
+                retval = service_sync_fail(sync, "invalid data message");
+                if (retval < 0)
+                    return retval;
+
+                return -BFDEV_ENOERR;
         }
 
         if (size > SYNC_MAXDATA)
             return -BFDEV_E2BIG;
 
-        length -= sizeof(*syncmsg);
+        length -= retlen;
+        data += retlen;
         sync->inprogress = size;
     }
 
@@ -905,31 +998,42 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
 }
 
 static int
-sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode)
+sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode, void *data, size_t length)
 {
-	sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
+    int retval;
+
+    sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
         O_CREAT | O_EXCL, mode);
-	if (sync->fd < 0 && errno == ENOENT) {
-		recursion_mkdir(filename);
+    if (sync->fd < 0 && errno == ENOENT) {
+        recursion_mkdir(filename);
 
         /* no directory, try again */
-		sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
+        sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
             O_CREAT | O_EXCL, mode);
-	}
+    }
 
     if (sync->fd < 0 && errno == EEXIST) {
         /* file exist, try again */
-		sync->fd = open(filename, O_WRONLY | O_NONBLOCK, mode);
+        sync->fd = open(filename, O_WRONLY | O_NONBLOCK, mode);
     }
 
     if (sync->fd < 0) {
         bfdev_log_err("sync send file: failed to open file %s error %d\n",
             filename, errno);
-		return -BFDEV_EACCES;
+
+        retval = service_sync_fail(sync, "failed to open file");
+        if (retval < 0)
+            return retval;
+
+        return -BFDEV_ENOERR;
     }
 
     bfdev_log_debug("sync send file: started %s mode %o\n", filename, mode);
     sync->service.write = sync_send_file_write;
+
+    retval = sync_send_file_write(&sync->service, data, length);
+    if (retval < 0)
+        return retval;
 
     return -BFDEV_ENOERR;
 }
@@ -941,27 +1045,27 @@ sync_send_link(struct sdbd_sync_service *sync, char *filename)
 }
 
 static int
-service_sync_send(struct sdbd_sync_service *sync, char *filename)
+service_sync_send(struct sdbd_sync_service *sync, char *filename, void *data, size_t length)
 {
-	mode_t mode;
-	char *flags;
+    mode_t mode;
+    char *flags;
     bool islink;
-	int retval;
+    int retval;
 
-	flags = strrchr(filename,',');
-	if (flags) {
-		*flags++ = '\0';
-		mode = strtoul(flags, NULL, 0);
-		islink = S_ISLNK(mode);
-		mode &= 0777;
-	}
+    flags = strrchr(filename,',');
+    if (flags) {
+        *flags++ = '\0';
+        mode = strtoul(flags, NULL, 0);
+        islink = S_ISLNK(mode);
+        mode &= 0777;
+    }
 
-	if (!flags || errno) {
+    if (!flags || errno) {
         mode = 0644;
         islink = 0;
     }
 
-	if (islink) {
+    if (islink) {
         retval = sync_send_link(sync, filename);
         if (retval < 0)
             return retval;
@@ -971,7 +1075,7 @@ service_sync_send(struct sdbd_sync_service *sync, char *filename)
     mode |= (mode >> 3) & 0070;
     mode |= (mode >> 3) & 0007;
 
-    retval = sync_send_file(sync, filename, mode);
+    retval = sync_send_file(sync, filename, mode, data, length);
     if (retval < 0)
         return retval;
 
@@ -1002,11 +1106,11 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
     BFDEV_BUG_ON(deepth != 1);
 
     if (request.error) {
-        if (request.error == ESHUTDOWN)
-            return -BFDEV_ESHUTDOWN;
+        retval = service_sync_fail(sync, "failed to read file");
+        if (retval < 0)
+            return retval;
 
-        bfdev_log_err("sync recv handled: error %d\n", request.error);
-        return -BFDEV_EFAULT;
+        return -BFDEV_ENOERR;
     }
 
     switch (request.event) {
@@ -1086,8 +1190,13 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     int retval;
 
     sync = bfdev_container_of(service, struct sdbd_sync_service, service);
-    if (length < sizeof(*syncmsg))
-        return -BFDEV_EREMOTEIO;
+    if (length < sizeof(*syncmsg)) {
+        retval = service_sync_fail(sync, "command read failure");
+        if (retval < 0)
+            return retval;
+
+        return -BFDEV_ENOERR;
+    }
 
     syncmsg = data;
     cmd = bfdev_le32_to_cpu(syncmsg->id);
@@ -1097,16 +1206,24 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     length -= sizeof(*syncmsg);
 
     bfdev_log_debug("sync write: remaining %lu namelen %u\n", length, namelen);
-    if (namelen > SYNC_MAXNAME)
-        return -BFDEV_EBADMSG;
+    if (namelen > SYNC_MAXNAME) {
+        retval = service_sync_fail(sync, "invalid namelen");
+        if (retval < 0)
+            return retval;
 
-    if (length != namelen) {
-        bfdev_log_warn("sync write: namelen not equal to remaining\n");
+        return -BFDEV_ENOERR;
+    }
+
+    if (length < namelen) {
+        bfdev_log_warn("sync write: namelen bigger than remaining\n");
         bfdev_min_adj(namelen, length);
     }
 
     memcpy(filename, data, namelen);
     filename[namelen] = '\0';
+
+    data += namelen;
+    length -= namelen;
 
     bfdev_log_notice("sync write: command %c%c%c%c filename %s\n",
         (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
@@ -1126,7 +1243,7 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
             break;
 
         case SYNC_CMD_SEND:
-            retval = service_sync_send(sync, filename);
+            retval = service_sync_send(sync, filename, data, length);
             if (retval < 0)
                 return retval;
             break;
@@ -1137,9 +1254,16 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
                 return retval;
             break;
 
-        case SYNC_CMD_QUIT: default:
-            send_close(service->sctx, 0, service->remote);
-            service_sync_close(service);
+        case SYNC_CMD_QUIT:
+            retval = send_close(sync->service.sctx, 0, sync->service.remote);
+            if (retval < 0)
+                return retval;
+            break;
+
+        default:
+            retval = service_sync_fail(sync, "unknown command");
+            if (retval < 0)
+                return retval;
             break;
     }
 
@@ -1162,6 +1286,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     sync->service.local = ++sctx->sockid;
     sync->service.write = service_sync_write;
     sync->service.close = service_sync_close;
+    bfdev_array_init(&sync->service.stream, NULL, sizeof(uint8_t));
 
     sync->fileio = bfenv_iothread_create(NULL, SYNC_FIFO_DEEPTH,
         BFENV_IOTHREAD_SIGREAD);
@@ -1392,13 +1517,6 @@ adb_usb_recv_handle(struct sdbd_ctx *sctx)
     if (retval < 0)
         return retval;
 
-    /* reregister usbio read handler */
-    bfdev_log_debug("usbio read: message\n");
-    retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
-        &sctx->msgbuff, sizeof(sctx->msgbuff));
-    if (retval < 0)
-        return retval;
-
     return -BFDEV_ENOERR;
 }
 
@@ -1428,20 +1546,36 @@ sdbd_usb_out_handle(bfenv_eproc_event_t *event, void *pdata)
         if (request.error == ESHUTDOWN)
             return -BFDEV_ESHUTDOWN;
 
-        bfdev_log_err("usb handled: error %d\n", request.error);
+        bfdev_log_err("usb out handled: error %d\n", request.error);
         return -BFDEV_EFAULT;
+    }
+
+    if (request.size != sizeof(sctx->msgbuff)) {
+        bfdev_log_notice("usb out handled: packet size mismatch %u\n",
+            request.size);
+        goto finish;
     }
 
     switch (request.event) {
         case BFENV_IOTHREAD_EVENT_READ:
             retval = adb_usb_recv_handle(sctx);
+            if (retval < 0)
+                return retval;
             break;
 
         default:
             BFDEV_BUG();
     }
 
-    return retval;
+finish:
+    /* reregister usbio read handler */
+    bfdev_log_debug("usbio read: message\n");
+    retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
+        &sctx->msgbuff, sizeof(sctx->msgbuff));
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
 }
 
 static int
