@@ -16,6 +16,7 @@
 #include <sys/signalfd.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#include <inttypes.h>
 #include <dirent.h>
 #include <utime.h>
 #include <linux/usb/ch9.h>
@@ -545,7 +546,7 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, si
     packet.length = size;
     memcpy(packet.payload, data, size);
 
-    bfdev_log_debug("send data: local %u remote %u size %lu\n",
+    bfdev_log_debug("send data: local %u remote %u size %zu\n",
         local, remote, size);
     return send_packet(sctx, &packet);
 }
@@ -556,7 +557,7 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, s
     size_t xfer;
     int retval;
 
-    bfdev_log_debug("send datas: local %u remote %u size %lu\n",
+    bfdev_log_debug("send datas: local %u remote %u size %zu\n",
         local, remote, size);
     for (; (xfer = bfdev_min(size, MAX_PAYLOAD)); size -= xfer) {
         retval = send_data(sctx, local, remote, data, xfer);
@@ -923,7 +924,7 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
     int retval;
 
     sync = bfdev_container_of(service, struct sdbd_sync_service, service);
-    bfdev_log_debug("sync send file write: inprogress %lu\n", sync->inprogress);
+    bfdev_log_debug("sync send file write: inprogress %zu\n", sync->inprogress);
 
     while (length) {
         if (sync->inprogress) {
@@ -1104,7 +1105,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_EIO;
     }
 
-    bfdev_log_debug("sync recv handled: pending %lu\n", count);
+    bfdev_log_debug("sync recv handled: pending %" PRIu64 "\n", count);
     BFDEV_BUG_ON(count != 1);
 
     deepth = bfdev_fifo_get(&sync->fileio->done_works, &request);
@@ -1126,7 +1127,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
             BFDEV_BUG();
     }
 
-    bfdev_log_debug("sync recv handled: remaining %ld\n", request.size);
+    bfdev_log_debug("sync recv handled: remaining %zd\n", request.size);
     if (!request.size) {
         syncmsg.id = SYNC_CMD_DONE;
         syncmsg.size = 0;
@@ -1210,7 +1211,7 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     data += sizeof(*syncmsg);
     length -= sizeof(*syncmsg);
 
-    bfdev_log_debug("sync write: remaining %lu namelen %u\n", length, namelen);
+    bfdev_log_debug("sync write: remaining %zu namelen %u\n", length, namelen);
     if (namelen > SYNC_MAXNAME) {
         retval = service_sync_fail(sync, "invalid namelen");
         if (retval < 0)
@@ -1541,7 +1542,7 @@ sdbd_usb_out_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_EIO;
     }
 
-    bfdev_log_debug("usb out handled: pending %lu\n", count);
+    bfdev_log_debug("usb out handled: pending %" PRIu64 "\n", count);
     BFDEV_BUG_ON(count != 1);
 
     deepth = bfdev_fifo_get(&sctx->usbio_out->done_works, &request);
@@ -1556,7 +1557,7 @@ sdbd_usb_out_handle(bfenv_eproc_event_t *event, void *pdata)
     }
 
     if (request.size != sizeof(sctx->msgbuff)) {
-        bfdev_log_notice("usb out handled: packet size mismatch %u\n",
+        bfdev_log_notice("usb out handled: packet size mismatch %zu\n",
             request.size);
         goto finish;
     }
@@ -1599,7 +1600,7 @@ sdbd_usb_in_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_EIO;
     }
 
-    bfdev_log_debug("usb in handled: pending %lu\n", count);
+    bfdev_log_debug("usb in handled: pending %" PRIu64 "\n", count);
     BFDEV_BUG_ON(count < 1);
 
     while (count--) {
