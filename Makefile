@@ -4,9 +4,8 @@
 #
 
 SDBD_C_FLAGS = -Wall -Wextra -Wno-unused-parameter \
-	-ffunction-sections -fdata-sections -Wl,--gc-sections \
-	-Wl,--whole-archive -Wl,-Bstatic -lbfenv -lbfdev \
-	-Wl,--no-whole-archive -Wl,-Bdynamic -lpthread -lutil
+	-Wl,--gc-sections -ffunction-sections -fdata-sections \
+	-lbfenv -lbfdev -lpthread -lutil
 
 SDBD_C_DEBUG_FLAGS = $(SDBD_C_FLAGS) -g -DDEBUG \
 	-fsanitize=address -fsanitize=undefined \
