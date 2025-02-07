@@ -29,11 +29,11 @@ uninstall:
 PHONY += uninstall
 
 sdbd: sdbd.c
-	gcc -o $@ $^ -O2 $(SDBD_C_FLAGS)
-	strip $@
+	$(CROSS_COMPILE)gcc -o $@ $^ -O2 $(SDBD_C_FLAGS)
+	$(CROSS_COMPILE)strip $@
 
 sdbd-debug: sdbd.c
-	gcc -o $@ $^ -O0 $(SDBD_C_DEBUG_FLAGS)
+	$(CROSS_COMPILE)gcc -o $@ $^ -O0 $(SDBD_C_DEBUG_FLAGS)
 
 # Declare the contents of the PHONY variable as phony.
 .PHONY: $(PHONY)
