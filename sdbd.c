@@ -42,9 +42,6 @@
 #define USB_FFS_ADB_IN USB_FFS_ADB_EP(ep2)
 
 /* USB Descriptor */
-#define ADB_DESC_MAGIC 1
-#define ADB_STR_MAGIC 2
-#define ADB_CLASS 0xff
 #define ADB_SUBCLASS 0x42
 #define ADB_PROTOCOL 0x1
 #define ADB_INTERFACE "ADB Interface"
@@ -93,7 +90,7 @@ cnxn_props[] = {
     "ro.product.device",
 };
 
-const char *
+static const char *
 cnxn_values[] = {
     "Linux",
     "Systemd",
@@ -141,8 +138,7 @@ struct sync_status {
 struct adb_functionfs_descs_head {
     bfdev_le32 magic;
     bfdev_le32 length;
-    bfdev_le32 fs_count;
-    bfdev_le32 hs_count;
+    bfdev_le32 flags;
 } __bfdev_packed;
 
 struct adb_functionfs_strings_head {
@@ -163,24 +159,29 @@ struct adb_endpoint_descriptor_no_audio {
 
 static const struct {
     struct adb_functionfs_descs_head header;
+	bfdev_le32 fs_count;
+	bfdev_le32 hs_count;
     struct {
         struct usb_interface_descriptor intf;
-        struct adb_endpoint_descriptor_no_audio source, sink;
+        struct adb_endpoint_descriptor_no_audio source;
+        struct adb_endpoint_descriptor_no_audio sink;
     } __bfdev_packed fs_descs, hs_descs;
 } __bfdev_packed adb_desc = {
     .header = {
-        .magic = ADB_DESC_MAGIC,
-        .length = sizeof(adb_desc),
-        .fs_count = 3,
-        .hs_count = 3,
+        .magic = bfdev_cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
+        .length = bfdev_cpu_to_le32(sizeof(adb_desc)),
+		.flags = bfdev_cpu_to_le32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC),
     },
+    .fs_count = bfdev_cpu_to_le32(3),
+    .hs_count = bfdev_cpu_to_le32(3),
     .fs_descs = {
         .intf = {
             .bLength = sizeof(adb_desc.fs_descs.intf),
             .bDescriptorType = USB_DT_INTERFACE,
             .bInterfaceNumber = 0,
+            .bAlternateSetting = 0,
             .bNumEndpoints = 2,
-            .bInterfaceClass = ADB_CLASS,
+            .bInterfaceClass = USB_CLASS_VENDOR_SPEC,
             .bInterfaceSubClass = ADB_SUBCLASS,
             .bInterfaceProtocol = ADB_PROTOCOL,
             .iInterface = 1,
@@ -190,14 +191,16 @@ static const struct {
             .bDescriptorType = USB_DT_ENDPOINT,
             .bEndpointAddress = 1 | USB_DIR_OUT,
             .bmAttributes = USB_ENDPOINT_XFER_BULK,
-            .wMaxPacketSize = MAX_PACKET_SIZE_FS,
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
+            .bInterval = 0,
         },
         .sink = {
             .bLength = sizeof(adb_desc.fs_descs.sink),
             .bDescriptorType = USB_DT_ENDPOINT,
             .bEndpointAddress = 2 | USB_DIR_IN,
             .bmAttributes = USB_ENDPOINT_XFER_BULK,
-            .wMaxPacketSize = MAX_PACKET_SIZE_FS,
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
+            .bInterval = 0,
         },
     },
     .hs_descs = {
@@ -205,8 +208,9 @@ static const struct {
             .bLength = sizeof(adb_desc.hs_descs.intf),
             .bDescriptorType = USB_DT_INTERFACE,
             .bInterfaceNumber = 0,
+            .bAlternateSetting = 0,
             .bNumEndpoints = 2,
-            .bInterfaceClass = ADB_CLASS,
+            .bInterfaceClass = USB_CLASS_VENDOR_SPEC,
             .bInterfaceSubClass = ADB_SUBCLASS,
             .bInterfaceProtocol = ADB_PROTOCOL,
             .iInterface = 1,
@@ -216,14 +220,16 @@ static const struct {
             .bDescriptorType = USB_DT_ENDPOINT,
             .bEndpointAddress = 1 | USB_DIR_OUT,
             .bmAttributes = USB_ENDPOINT_XFER_BULK,
-            .wMaxPacketSize = MAX_PACKET_SIZE_HS,
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
+            .bInterval = 0,
         },
         .sink = {
             .bLength = sizeof(adb_desc.hs_descs.sink),
             .bDescriptorType = USB_DT_ENDPOINT,
             .bEndpointAddress = 2 | USB_DIR_IN,
             .bmAttributes = USB_ENDPOINT_XFER_BULK,
-            .wMaxPacketSize = MAX_PACKET_SIZE_HS,
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
+            .bInterval = 0,
         },
     },
 };
@@ -236,13 +242,13 @@ static const struct {
     } __bfdev_packed lang;
 } __bfdev_packed adb_str = {
     .header = {
-        .magic = ADB_STR_MAGIC,
-        .length = sizeof(adb_str),
-        .str_count = 1,
-        .lang_count = 1,
+        .magic = bfdev_cpu_to_le32(FUNCTIONFS_STRINGS_MAGIC),
+        .length = bfdev_cpu_to_le32(sizeof(adb_str)),
+        .str_count = bfdev_cpu_to_le32(1),
+        .lang_count = bfdev_cpu_to_le32(1),
     },
     .lang = {
-        .code = 0x0409,
+        .code = bfdev_cpu_to_le16(0x409),
         .str = ADB_INTERFACE,
     },
 };
@@ -494,6 +500,7 @@ send_connect(struct sdbd_ctx *sctx)
 {
     struct sdbd_packet packet;
     size_t length;
+    int retval;
 
     packet.command = PCMD_CNXN;
     packet.args[0] = ADB_VERSION;
@@ -503,13 +510,18 @@ send_connect(struct sdbd_ctx *sctx)
     packet.length = length;
 
     bfdev_log_info("send connect\n");
-    return send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
 }
 
 static int
 send_close(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
 {
     struct sdbd_packet packet;
+    int retval;
 
     packet.command = PCMD_CLSE;
     packet.args[0] = local;
@@ -517,13 +529,18 @@ send_close(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
     packet.length = 0;
 
     bfdev_log_info("send close: local %u remote %u\n", local, remote);
-    return send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
 }
 
 static int
 send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
 {
     struct sdbd_packet packet;
+    int retval;
 
     packet.command = PCMD_OKAY;
     packet.args[0] = local;
@@ -531,13 +548,18 @@ send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
     packet.length = 0;
 
     bfdev_log_info("send okay: local %u remote %u\n", local, remote);
-    return send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
 }
 
 static int
 send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size)
 {
     struct sdbd_packet packet;
+    int retval;
 
     packet.command = PCMD_WRTE;
     packet.args[0] = local;
@@ -548,7 +570,11 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, si
 
     bfdev_log_debug("send data: local %u remote %u size %zu\n",
         local, remote, size);
-    return send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
 }
 
 static int
@@ -735,15 +761,27 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
 static struct sdbd_service *
 service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
 {
+    struct sdbd_service *service;
     char buff[MAX_PAYLOAD];
+
     bfdev_scnprintf(buff, sizeof(buff), "reboot %s", cmdline);
-    return service_shell_open(sctx, buff);
+    service = service_shell_open(sctx, buff);
+    if (!service)
+        return NULL;
+
+    return service;
 }
 
 static struct sdbd_service *
 service_remount_open(struct sdbd_ctx *sctx, char *cmdline)
 {
-    return service_shell_open(sctx, "mount -o remount,rw /system");
+    struct sdbd_service *service;
+
+    service = service_shell_open(sctx, "mount -o remount,rw /system");
+    if (!service)
+        return NULL;
+
+    return service;
 }
 
 static void
@@ -869,11 +907,11 @@ service_sync_list(struct sdbd_sync_service *sync, char *filename)
     closedir(dir);
 
 done:
-    syncmsg.id = SYNC_CMD_DONE;
-    syncmsg.mode = 0;
-    syncmsg.size = 0;
-    syncmsg.time = 0;
-    syncmsg.namelen = 0;
+    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DONE);
+    syncmsg.mode = bfdev_cpu_to_le32(0);
+    syncmsg.size = bfdev_cpu_to_le32(0);
+    syncmsg.time = bfdev_cpu_to_le32(0);
+    syncmsg.namelen = bfdev_cpu_to_le32(0);
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
@@ -1129,8 +1167,8 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 
     bfdev_log_debug("sync recv handled: remaining %zd\n", request.size);
     if (!request.size) {
-        syncmsg.id = SYNC_CMD_DONE;
-        syncmsg.size = 0;
+        syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DONE);
+        syncmsg.size = bfdev_cpu_to_le32(0);
 
         bfdev_log_info("shell recv handled: finish\n");
         retval = send_data(sync->service.sctx, sync->service.local,
@@ -1319,11 +1357,10 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     return &sync->service;
 }
 
-static struct {
+static const struct {
     const char *name;
     struct sdbd_service *(*open)(struct sdbd_ctx *sctx, char *cmdline);
-} const
-services[] = {
+} services[] = {
     {
         .name = "shell:",
         .open = service_shell_open,
@@ -1954,10 +1991,10 @@ version(void)
 
 static const struct option
 options[] = {
-    {"help", no_argument, 0, 'h'},
-    {"version", no_argument, 0, 'v'},
-    {"daemon", no_argument, 0, 'd'},
-    {"test", no_argument, 0, 't'},
+    {"help", no_argument, NULL, 'h'},
+    {"version", no_argument, NULL, 'v'},
+    {"daemon", no_argument, NULL, 'd'},
+    {"test", no_argument, NULL, 't'},
     { }, /* NULL */
 };
 
