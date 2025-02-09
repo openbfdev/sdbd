@@ -11,7 +11,9 @@
 ## Features
 
 - [x] Daemon mode
-- [x] Support USB hot plugging
+- [x] Automatic timeout close for unresponsive services
+- [x] Cross endianness (Big-Endian / Little-Endian)
+- [x] USB hot plugging
 - [x] Shell command
 - [x] Reboot command
 - [x] Remount command
@@ -27,19 +29,49 @@ $ adb push local-path remote-path # push files to device
 $ adb pull remote-path local-path # pull files from device
 ```
 
-## Benchmark Test
+## Benchmark test
 
-sdbd speed:
+SDBD speed:
 
 ![sdbd-speed](./docs/sdbd-speed.png)
 
-adbd speed:
+ADBD speed:
 
 ![adbd-speed](./docs/adbd-speed.png)
 
 **SDBD is five times the speed of ADBD.**
 
-## Reference Link
+## How to use
+
+Usage:
+
+```shell
+$ sdbd --help
+Usage: ./sdbd [option] ...
+Simple Debug Bridge Daemon (SDBD) v0.1
+
+Options:
+  -h, --help            Display this information.
+  -v, --version         Display version information.
+  -d, --daemon          Run in daemon mode.
+  -l, --loglevel=LEVEL  Set print log level threshold.
+  -t, --timout=SECONDS  Set service idle timeout value.
+
+The following optionals are for loglevel:
+  0: Emerg    (System is unusable)
+  1: Alert    (Action must be taken immediately)
+  2: Crit     (Critical conditions)
+  3: Error    (Error conditions)
+  4: Warning  (Warning conditions)
+  5: Notice   (Normal but significant condition)
+  6: Info     (Informational)
+  7: Debug    (Debug-level messages)
+
+For bug reporting, please visit:
+<https://github.com/openbfdev/sdbd>
+```
+
+## Reference link
 
 - [xdbd](https://github.com/openbfdev/xdbd): https://github.com/openbfdev/xdbd
 - [adbd](https://github.com/BigfootACA/adbd): https://github.com/BigfootACA/adbd
