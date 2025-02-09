@@ -82,6 +82,7 @@
 
 static bool sdbd_daemon;
 static const char *sdbd_shell;
+static unsigned long sdbd_timeout = SERVICE_TIMEOUT;
 
 static const char *
 cnxn_props[] = {
@@ -264,6 +265,7 @@ struct sdbd_packet {
 
 struct sdbd_service {
     struct sdbd_ctx *sctx;
+    bfenv_eproc_timer_t timer;
     bfdev_array_t stream;
     int (*write)(struct sdbd_service *service, void *data, size_t length);
     void (*close)(struct sdbd_service *service);
@@ -342,7 +344,7 @@ sdbd_read(int fd, void *data, size_t size)
                 break;
 
             default:
-                bfdev_log_crit("sdbd read: error %d\n", errno);
+                bfdev_log_warn("sdbd read: error %d\n", errno);
                 return -BFDEV_EIO;
         }
     } while (count < size);
@@ -384,7 +386,7 @@ sdbd_write(int fd, const void *data, size_t size)
 }
 
 static int
-async_usb_issue(struct sdbd_ctx *sctx, const void *data, size_t size)
+async_usb_enqueue(struct sdbd_ctx *sctx, const void *data, size_t size)
 {
     int retval;
 
@@ -419,7 +421,7 @@ async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
         return -BFDEV_ENOMEM;
 
     memcpy(buff, data, size);
-    retval = async_usb_issue(sctx, buff, size);
+    retval = async_usb_enqueue(sctx, buff, size);
     if (retval < 0)
         return retval;
 
@@ -673,6 +675,7 @@ service_shell_close(struct sdbd_service *service)
 
     bfdev_log_notice("shell close\n");
     shell = bfdev_container_of(service, struct sdbd_shell_service, service);
+    send_close(shell->service.sctx, 0, shell->service.remote);
     kill(shell->pid, SIGKILL);
 
     bfenv_eproc_event_remove(service->sctx->eproc, &shell->event);
@@ -694,10 +697,6 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
     shell = pdata;
     if (bfenv_eproc_error_test(&event->events)) {
         bfdev_log_info("shell handled: disconnected\n");
-        retval = send_close(shell->service.sctx, 0, shell->service.remote);
-        if (retval < 0)
-            return retval;
-
         service_shell_close(&shell->service);
         return -BFDEV_ENOERR;
     }
@@ -791,6 +790,8 @@ service_sync_close(struct sdbd_service *service)
 
     bfdev_log_notice("sync close\n");
     sync = bfdev_container_of(service, struct sdbd_sync_service, service);
+    send_close(sync->service.sctx, 0, sync->service.remote);
+
     if (sync->fd > 0)
         close(sync->fd);
 
@@ -833,10 +834,6 @@ service_sync_fail(struct sdbd_sync_service *sync, char *msg)
 
     bfdev_log_warn("service sync fail: %s\n", msg);
     retval = service_sync_status(sync, SYNC_CMD_FAIL, msg);
-    if (retval < 0)
-        return retval;
-
-    retval = send_close(sync->service.sctx, 0, sync->service.remote);
     if (retval < 0)
         return retval;
 
@@ -1467,6 +1464,19 @@ static const struct {
 };
 
 static int
+service_timemout(bfenv_eproc_timer_t *timer, void *pdata)
+{
+    struct sdbd_service *service;
+
+    service = pdata;
+    bfdev_log_notice("service timeout: local %u remote %u\n",
+        service->local, service->remote);
+    service->close(service);
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 service_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
@@ -1489,6 +1499,13 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
             return BFDEV_PTR_INVAL(service);
 
         retval = send_okay(sctx, service->local, service->remote);
+        if (retval < 0)
+            return retval;
+
+        service->timer.func = service_timemout;
+        service->timer.pdata = service;
+        retval = bfenv_eproc_timer_add(sctx->eproc, &service->timer,
+            sdbd_timeout);
         if (retval < 0)
             return retval;
 
@@ -1529,6 +1546,12 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
     if (retval < 0)
         return retval;
 
+    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
+    retval = bfenv_eproc_timer_add(sctx->eproc, &service->timer,
+        sdbd_timeout);
+    if (retval < 0)
+        return retval;
+
     return -BFDEV_ENOERR;
 }
 
@@ -1546,6 +1569,7 @@ service_close(struct sdbd_ctx *sctx)
     }
 
     service = *psrv;
+    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
     service->close(service);
 }
 
@@ -1770,7 +1794,7 @@ sdbd_signal_handle(bfenv_eproc_event_t *event, void *pdata)
     switch (si.ssi_signo) {
         case SIGCHLD:
             bfdev_log_debug("signal handled: release childrens\n");
-            waitpid(-1, NULL, 0);
+            waitpid(-1, NULL, WNOHANG);
             break;
 
         case SIGINT:
@@ -2061,10 +2085,22 @@ usage(const char *path)
 
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
-    fprintf(stderr, "  -h, --help       Display this information.\n");
-    fprintf(stderr, "  -v, --version    Display version information.\n");
-    fprintf(stderr, "  -d, --daemon     Run as daemon mode.\n");
-    fprintf(stderr, "  -t, --test       Print debug level log.\n");
+    fprintf(stderr, "  -h, --help            Display this information.\n");
+    fprintf(stderr, "  -v, --version         Display version information.\n");
+    fprintf(stderr, "  -d, --daemon          Run in daemon mode.\n");
+    fprintf(stderr, "  -l, --loglevel=LEVEL  Set print log level threshold.\n");
+    fprintf(stderr, "  -t, --timout=SECONDS  Set service idle timeout value.\n");
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "The following optionals are for loglevel:\n");
+    fprintf(stderr, "  0: Emerg    (System is unusable)\n");
+    fprintf(stderr, "  1: Alert    (Action must be taken immediately)\n");
+    fprintf(stderr, "  2: Crit     (Critical conditions)\n");
+    fprintf(stderr, "  3: Error    (Error conditions)\n");
+    fprintf(stderr, "  4: Warning  (Warning conditions)\n");
+    fprintf(stderr, "  5: Notice   (Normal but significant condition)\n");
+    fprintf(stderr, "  6: Info     (Informational)\n");
+    fprintf(stderr, "  7: Debug    (Debug-level messages)\n");
 
     fprintf(stderr, "\n");
     fprintf(stderr, "For bug reporting, please visit:\n");
@@ -2084,13 +2120,15 @@ options[] = {
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'v'},
     {"daemon", no_argument, NULL, 'd'},
-    {"test", no_argument, NULL, 't'},
+    {"loglevel", required_argument, NULL, 'l'},
+    {"timeout", required_argument, NULL, 't'},
     { }, /* NULL */
 };
 
 int
 main(int argc, char *const argv[])
 {
+    unsigned long value;
     int arg, optidx;
     int retval;
 
@@ -2098,7 +2136,7 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdt", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdl:t:", options, &optidx);
         if (arg == -1)
             break;
 
@@ -2107,18 +2145,32 @@ main(int argc, char *const argv[])
                 sdbd_daemon = true;
                 break;
 
+            case 'l':
+                value = strtoul(optarg, NULL, 10);
+                if (!isdigit(*optarg) || value > BFDEV_LEVEL_DEBUG) {
+                    fprintf(stderr, "Invalid loglevel value: %s\n", optarg);
+                    usage(argv[0]);
+                }
+                bfdev_log_default.record_level = value;
+                break;
+
             case 't':
-                bfdev_log_default.record_level = BFDEV_LEVEL_DEBUG;
+                value = strtoul(optarg, NULL, 10);
+                if (!isdigit(*optarg)) {
+                    fprintf(stderr, "Invalid timeout value: %s\n", optarg);
+                    usage(argv[0]);
+                }
+                sdbd_timeout = value * 1000;
                 break;
 
             case 'v':
                 version();
 
+            case 'h':
+                usage(argv[0]);
+
             default:
                 fprintf(stderr, "Unknown option: %c\n", arg);
-                bfdev_fallthrough;
-
-            case 'h':
                 usage(argv[0]);
         }
     }
