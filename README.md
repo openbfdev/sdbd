@@ -11,6 +11,8 @@
 ## Features
 
 - [x] Daemon mode
+- [x] Version 2 transmission protocol
+- [x] Shell version 2, can change windows size
 - [x] Automatic timeout close for unresponsive services
 - [x] Cross endianness (Big-Endian / Little-Endian)
 - [x] USB hot plugging
@@ -35,11 +37,15 @@ SDBD speed:
 
 ![sdbd-speed](./docs/sdbd-speed.png)
 
+SDBD v2 speed:
+
+![sdbd-speed](./docs/sdbd-v2-speed.png)
+
 ADBD speed:
 
 ![adbd-speed](./docs/adbd-speed.png)
 
-**SDBD is five times the speed of ADBD.**
+**SDBD is ten times the speed of ADBD.**
 
 ## How to use
 
@@ -75,6 +81,7 @@ For bug reporting, please visit:
 
 - [xdbd](https://github.com/openbfdev/xdbd): https://github.com/openbfdev/xdbd
 - [adbd](https://github.com/BigfootACA/adbd): https://github.com/BigfootACA/adbd
+- [google-adbd](https://android.googlesource.com/platform/system/adb): https://android.googlesource.com/platform/system/adb
 
 ## License
 

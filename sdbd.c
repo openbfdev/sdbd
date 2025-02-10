@@ -4,6 +4,7 @@
  */
 
 #include <stdint.h>
+#include <stdbool.h>
 #include <unistd.h>
 #include <getopt.h>
 #include <err.h>
@@ -12,6 +13,7 @@
 #include <fcntl.h>
 #include <pty.h>
 #include <sys/wait.h>
+#include <sys/ioctl.h>
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
@@ -25,7 +27,7 @@
 #define MODULE_NAME "sdbd"
 #define bfdev_log_fmt(fmt) MODULE_NAME ": " fmt
 
-#define SDBD_VERSION "v0.1"
+#define SDBD_VERSION "v0.2"
 #define SDBD_INFO MODULE_NAME "/" SDBD_VERSION
 
 #ifndef DEBUG
@@ -51,9 +53,10 @@
 /* ADB Version */
 #define ADB_VERSION 0x1000000
 #define ADB_DEVICE_BANNER "device"
-#define MAX_PAYLOAD 4096
+#define MAX_PAYLOAD (4 * 1024)
+#define MAX_PAYLOAD_V2 (256 * 1024)
 #define SYNC_MAXNAME 1024
-#define SYNC_MAXDATA 65536
+#define SYNC_MAXDATA (64 * 1024)
 
 /* ADB Command */
 #define PCMD_CNXN 0x4e584e43
@@ -74,6 +77,18 @@
 #define SYNC_CMD_FAIL 0x4c494146
 #define SYNC_CMD_QUIT 0x54495551
 
+#define SHELL_FUTURE_V2 "v2"
+#define SHELL_FUTURE_PTY "pty"
+#define SHELL_FUTURE_RAW "raw"
+#define SHELL_FUTURE_TERM "TERM="
+
+#define SHELL_CMD_STDIN 0
+#define SHELL_CMD_STDOUT 1
+#define SHELL_CMD_STDERR 2
+#define SHELL_CMD_EXIT 3
+#define SHELL_CMD_CLOSE 4
+#define SHELL_CMD_WINSIZE 5
+
 /* SDBD Configuration */
 #define USB_FIFO_DEEPTH 64
 #define SYNC_FIFO_DEEPTH 32
@@ -89,6 +104,7 @@ cnxn_props[] = {
     "ro.product.name",
     "ro.product.model",
     "ro.product.device",
+    "features",
 };
 
 static const char *
@@ -96,6 +112,7 @@ cnxn_values[] = {
     "Linux",
     "Systemd",
     "GNU",
+    "shell_v2,cmd",
 };
 
 struct adb_message {
@@ -104,6 +121,11 @@ struct adb_message {
     bfdev_le32 length;
     bfdev_le32 cksum;
     bfdev_le32 magic;
+} __bfdev_packed;
+
+struct shell_data {
+    uint8_t id;
+    bfdev_le32 size;
 } __bfdev_packed;
 
 struct sync_request {
@@ -260,7 +282,7 @@ struct sdbd_packet {
     uint32_t length;
     uint32_t cksum;
     uint32_t magic;
-    uint8_t payload[MAX_PAYLOAD];
+    uint8_t payload[MAX_PAYLOAD_V2];
 };
 
 struct sdbd_service {
@@ -278,17 +300,25 @@ struct sdbd_shell_service {
     struct sdbd_service service;
     bfenv_eproc_event_t event;
     pid_t pid;
+
+    size_t inprogress;
+    uint32_t cmd;
+    uint32_t size;
+
+    bool v2;
+    char *term;
 };
 
 struct sdbd_sync_service {
     struct sdbd_service service;
-    bfenv_eproc_event_t event;
     uint32_t cmd;
     uint32_t namelen;
-    size_t inprogress;
 
-    int fd;
+    bfenv_eproc_event_t event;
     bfenv_iothread_t *fileio;
+    int fd;
+
+    size_t inprogress;
     char filename[SYNC_MAXNAME + 1];
     uint8_t buff[SYNC_MAXDATA];
 };
@@ -298,6 +328,9 @@ struct sdbd_ctx {
     BFDEV_DECLARE_RADIX(services, struct sdbd_service *);
     bfenv_iothread_t *usbio_in;
     bfenv_iothread_t *usbio_out;
+
+    uint32_t version;
+    uint32_t max_payload;
 
     int fd_ctr;
     int fd_out;
@@ -511,13 +544,16 @@ send_connect(struct sdbd_ctx *sctx)
     int retval;
 
     packet.command = PCMD_CNXN;
-    packet.args[0] = ADB_VERSION;
-    packet.args[1] = MAX_PAYLOAD;
+    packet.args[0] = sctx->version;
+    packet.args[1] = sctx->max_payload;
 
     length = make_connect_data((char *)packet.payload, sizeof(packet.payload));
+    if (length > MAX_PAYLOAD)
+        bfdev_log_warn("send connect: banner too large\n");
+
+    bfdev_log_info("send connect: '%s'\n", packet.payload);
     packet.length = length;
 
-    bfdev_log_info("send connect\n");
     retval = send_packet(sctx, &packet);
     if (retval < 0)
         return retval;
@@ -593,7 +629,7 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, s
 
     bfdev_log_debug("send datas: local %u remote %u size %zu\n",
         local, remote, size);
-    for (; (xfer = bfdev_min(size, MAX_PAYLOAD)); size -= xfer) {
+    for (; (xfer = bfdev_min(size, sctx->max_payload)); size -= xfer) {
         retval = send_data(sctx, local, remote, data, xfer);
         if (retval < 0)
             return retval;
@@ -603,8 +639,44 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, s
     return -BFDEV_ENOERR;
 }
 
+static int
+stream_append(struct sdbd_service *service, void *data, size_t size)
+{
+    void *buff;
+
+    buff = bfdev_array_push(&service->stream, size);
+    if (!buff)
+        return -BFDEV_ENOMEM;
+    memcpy(buff, data, size);
+
+    return -BFDEV_ENOERR;
+}
+
+static ssize_t
+stream_accumulate(struct sdbd_service *service, size_t request, void *data, size_t append)
+{
+    size_t alreary, remain, avail;
+    int retval;
+
+    alreary = bfdev_array_size(&service->stream);
+    BFDEV_BUG_ON(alreary > request);
+
+    remain = request - alreary;
+    avail = bfdev_min(remain, append);
+
+    retval = stream_append(service, data, append);
+    if (retval < 0)
+        return retval;
+
+    if (append < remain)
+        return -BFDEV_EAGAIN;
+
+    return avail;
+}
+
 static pid_t
-spawn_shell(int *amaster, const char *path, char *cmdline)
+spawn_shell(struct sdbd_shell_service *shell, int *amaster,
+            const char *path, char *cmdline)
 {
     pid_t pid;
     char *value;
@@ -614,12 +686,19 @@ spawn_shell(int *amaster, const char *path, char *cmdline)
     if (pid != 0)
         return pid;
 
-    value = getenv("TERM");
-    if (!value) {
-        retval = setenv("TERM", "xterm-256color", 0);
-        if (retval < 0)
-            exit(retval);
-    }
+    value = NULL;
+    if (shell->v2 && shell->term)
+        value = shell->term;
+
+    if (!value)
+        value = getenv("TERM");
+
+    if (!value)
+        value = "xterm-256color";
+
+    retval = setenv("TERM", value, 0);
+    if (retval < 0)
+        exit(retval);
 
     value = getenv("HOME");
     if (value) {
@@ -634,38 +713,6 @@ spawn_shell(int *amaster, const char *path, char *cmdline)
 
     /* should never come here */
     BFDEV_BUG();
-}
-
-static ssize_t
-stream_accumulate(struct sdbd_service *service, size_t request, void *data, size_t append)
-{
-    size_t alreary, remain, avail;
-    void *buff;
-
-    alreary = bfdev_array_size(&service->stream);
-    BFDEV_BUG_ON(alreary > request);
-
-    remain = request - alreary;
-    avail = bfdev_min(remain, append);
-
-    buff = bfdev_array_push(&service->stream, avail);
-    if (!buff)
-        return -BFDEV_ENOMEM;
-
-    memcpy(buff, data, avail);
-    if (append < remain)
-        return -BFDEV_EAGAIN;
-
-    return avail;
-}
-
-static int
-service_shell_write(struct sdbd_service *service, void *data, size_t length)
-{
-    struct sdbd_shell_service *shell;
-
-    shell = bfdev_container_of(service, struct sdbd_shell_service, service);
-    return sdbd_write(shell->event.fd, data, length);
 }
 
 static void
@@ -686,10 +733,138 @@ service_shell_close(struct sdbd_service *service)
 }
 
 static int
+service_shell_write(struct sdbd_service *service, void *data, size_t length)
+{
+    struct sdbd_shell_service *shell;
+    struct shell_data *shellmsg;
+    uint32_t cmd, size;
+    ssize_t retlen;
+    int retval;
+
+    shell = bfdev_container_of(service, struct sdbd_shell_service, service);
+    bfdev_log_debug("shell write: inprogress %zu\n", shell->inprogress);
+    if (!shell->v2) {
+        retval = sdbd_write(shell->event.fd, data, length);
+        if (retval < 0)
+            return retval;
+
+        return -BFDEV_ENOERR;
+    }
+
+    while (length) {
+        if (shell->inprogress) {
+            size = bfdev_min(shell->inprogress, length);
+            bfdev_log_debug("shell write: write %u\n", size);
+            shell->inprogress -= size;
+
+            switch (shell->cmd) {
+                case SHELL_CMD_STDIN:
+                    retval = sdbd_write(shell->event.fd, data, length);
+                    if (retval < 0)
+                        return retval;
+                    break;
+
+                case SHELL_CMD_WINSIZE: {
+                    int rows, cols, xpixs, ypixs;
+                    struct winsize wsize;
+                    char *value;
+
+                    retval = stream_accumulate(&shell->service,
+                        shell->size, data, size);
+                    if (retval < 0) {
+                        if (retval == -BFDEV_EAGAIN)
+                            break;
+
+                        bfdev_log_err("shell write: append winsize failed\n");
+                        return retval;
+                    }
+
+                    retval = stream_append(&shell->service, "", 1);
+                    if (retval < 0) {
+                        bfdev_log_err("shell write: append zero failed\n");
+                        return retval;
+                    }
+
+                    value = bfdev_array_data(&shell->service.stream, 0);
+                    BFDEV_BUG_ON(!value);
+
+                    bfdev_log_debug("shell write: winsize '%s'\n", value);
+                    if (sscanf(value, "%dx%d,%dx%d", &rows, &cols,
+                        &xpixs, &ypixs) != 4) {
+                        bfdev_log_warn("shell write: winsize format error\n");
+                        service_shell_close(service);
+                        return -BFDEV_ENOERR;
+                    }
+
+                    bfdev_array_reset(&service->stream);
+                    wsize.ws_row = rows;
+                    wsize.ws_col = cols;
+                    wsize.ws_xpixel = xpixs;
+                    wsize.ws_ypixel = ypixs;
+                    ioctl(shell->event.fd, TIOCSWINSZ, &wsize);
+                    break;
+                }
+            }
+
+            length -= size;
+            data += size;
+
+            continue;
+        }
+
+        retlen = stream_accumulate(&shell->service, sizeof(*shellmsg), data, length);
+        if (retlen < 0) {
+            if (retlen == -BFDEV_EAGAIN) {
+                bfdev_log_debug("shell write: wait header\n");
+                return -BFDEV_ENOERR;
+            }
+
+            bfdev_log_debug("shell write: wait failed\n");
+            return retlen;
+        }
+
+        shellmsg = bfdev_array_data(&shell->service.stream, 0);
+        BFDEV_BUG_ON(!shellmsg);
+
+        cmd = shellmsg->id;
+        size = bfdev_le32_to_cpu(shellmsg->size);
+        bfdev_array_reset(&shell->service.stream);
+
+        bfdev_log_debug("shell write: cmd %d size %u\n", cmd, size);
+
+        length -= retlen;
+        data += retlen;
+
+        switch (cmd) {
+            case SHELL_CMD_STDIN:
+            case SHELL_CMD_WINSIZE:
+                shell->cmd = cmd;
+                shell->size = size;
+                break;
+
+            case SHELL_CMD_CLOSE:
+            default:
+                service_shell_close(service);
+                return -BFDEV_ENOERR;
+        }
+
+        if (size > service->sctx->max_payload) {
+            service_shell_close(service);
+            return -BFDEV_ENOERR;
+        }
+
+        shell->inprogress = size;
+    }
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
 {
     struct sdbd_shell_service *shell;
-    uint8_t buffer[MAX_PAYLOAD];
+    struct shell_data shellmsg;
+    uint8_t buffer[MAX_PAYLOAD_V2];
     ssize_t length;
     int retval;
 
@@ -701,9 +876,26 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_ENOERR;
     }
 
-    length = read(event->fd, buffer, MAX_PAYLOAD);
+    length = read(event->fd, buffer, shell->service.sctx->max_payload);
     if (length <= 0)
         return -BFDEV_EIO;
+
+    if (!shell->v2) {
+        retval = send_data(shell->service.sctx, shell->service.local,
+            shell->service.remote, buffer, length);
+        if (retval < 0)
+            return retval;
+
+        return -BFDEV_ENOERR;
+    }
+
+    shellmsg.id = SHELL_CMD_STDOUT;
+    shellmsg.size = bfdev_cpu_to_le32(length);
+
+    retval = send_data(shell->service.sctx, shell->service.local,
+        shell->service.remote, &shellmsg, sizeof(shellmsg));
+    if (retval < 0)
+        return retval;
 
     retval = send_data(shell->service.sctx, shell->service.local,
         shell->service.remote, buffer, length);
@@ -721,10 +913,44 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     int amaster, retval;
     pid_t pid;
 
-    bfdev_log_notice("shell open: cmdline %s\n", cmdline);
+    bfdev_log_notice("shell open: cmdline '%s'\n", cmdline);
     shell = bfdev_zalloc(NULL, sizeof(*shell));
     if (!shell)
         return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+
+    for (;;) {
+        unsigned long offset;
+        char *parse, sch;
+
+        parse = cmdline;
+        offset = strcspn(cmdline, ",:");
+        if (!cmdline[offset])
+            return NULL;
+
+        cmdline += offset;
+        sch = *cmdline;
+        *cmdline++ = '\0';
+
+        bfdev_log_debug("shell open: parse '%s'\n", parse);
+        if (!strcmp(parse, SHELL_FUTURE_V2)) {
+            bfdev_log_debug("shell open: enable v2\n");
+            shell->v2 = true;
+        }
+
+        if (!strncmp(parse, SHELL_FUTURE_TERM, sizeof(SHELL_FUTURE_TERM) - 1)) {
+            parse += sizeof(SHELL_FUTURE_TERM) - 1;
+            bfdev_log_debug("shell open: use term '%s'\n", parse);
+            shell->term = bfdev_strdup(NULL, parse);
+            if (!shell->term)
+                return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+        }
+
+        if (sch == ':')
+            break;
+    }
+
+    if (!*cmdline)
+        cmdline = NULL;
 
     shell->service.sctx = sctx;
     shell->service.remote = sctx->args[0];
@@ -733,7 +959,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     shell->service.close = service_shell_close;
     bfdev_array_init(&shell->service.stream, NULL, sizeof(uint8_t));
 
-    pid = spawn_shell(&amaster, sdbd_shell, cmdline);
+    pid = spawn_shell(shell, &amaster, sdbd_shell, cmdline);
     if (pid < 0)
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
 
@@ -759,10 +985,10 @@ static struct sdbd_service *
 service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
-    char buff[MAX_PAYLOAD];
+    char buff[MAX_PAYLOAD_V2];
 
-    bfdev_log_notice("reboot open: cmdline %s\n", cmdline);
-    bfdev_scnprintf(buff, sizeof(buff), "reboot %s", cmdline);
+    bfdev_log_notice("reboot open: cmdline '%s'\n", cmdline);
+    bfdev_scnprintf(buff, sizeof(buff), "reboot '%s'", cmdline);
     service = service_shell_open(sctx, buff);
     if (!service)
         return NULL;
@@ -807,19 +1033,21 @@ static int
 service_sync_status(struct sdbd_sync_service *sync, uint32_t cmd, char *msg)
 {
     struct sync_status syncmsg;
+    size_t length;
     int retval;
 
+    length = strlen(msg);
     syncmsg.id = bfdev_cpu_to_le32(cmd);
-    syncmsg.msglen = bfdev_cpu_to_le32(strlen(msg));
+    syncmsg.msglen = bfdev_cpu_to_le32(length);
 
     retval = send_data(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (retval < 0)
         return retval;
 
-    if (syncmsg.msglen) {
+    if (length) {
         retval = send_data(sync->service.sctx, sync->service.local,
-            sync->service.remote, msg, syncmsg.msglen);
+            sync->service.remote, msg, length);
         if (retval < 0)
             return retval;
     }
@@ -832,7 +1060,7 @@ service_sync_fail(struct sdbd_sync_service *sync, char *msg)
 {
     int retval;
 
-    bfdev_log_warn("service sync fail: %s\n", msg);
+    bfdev_log_warn("service sync fail: '%s'\n", msg);
     retval = service_sync_status(sync, SYNC_CMD_FAIL, msg);
     if (retval < 0)
         return retval;
@@ -1013,7 +1241,7 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
 
     sync->fd = open(filename, O_RDONLY);
     if (sync->fd < 0) {
-        bfdev_log_err("sync recv: failed to open file %s error %d\n",
+        bfdev_log_err("sync recv: failed to open file '%s' error %d\n",
             filename, errno);
         return -BFDEV_EACCES;
     }
@@ -1103,6 +1331,8 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
         }
 
         syncmsg = bfdev_array_data(&sync->service.stream, 0);
+        BFDEV_BUG_ON(!syncmsg);
+
         cmd = bfdev_le32_to_cpu(syncmsg->id);
         size = bfdev_le32_to_cpu(syncmsg->size);
         bfdev_array_reset(&sync->service.stream);
@@ -1192,7 +1422,7 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode, void
     }
 
     if (sync->fd < 0) {
-        bfdev_log_err("sync send file: failed to open file %s error %d\n",
+        bfdev_log_err("sync send file: failed to open file '%s' error %d\n",
             filename, errno);
 
         retval = service_sync_fail(sync, "failed to open file");
@@ -1202,7 +1432,7 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode, void
         return -BFDEV_ENOERR;
     }
 
-    bfdev_log_debug("sync send file: started %s mode %o\n",
+    bfdev_log_debug("sync send file: started '%s' mode %o\n",
         filename, mode);
 
     sync->service.write = sync_send_file_write;
@@ -1277,11 +1507,13 @@ service_sync_write_name(struct sdbd_service *service, void *data, size_t length)
     }
 
     name = bfdev_array_data(&service->stream, 0);
+    BFDEV_BUG_ON(!name);
+
     memcpy(sync->filename, name, sync->namelen);
     sync->filename[sync->namelen] = '\0';
     bfdev_array_reset(&service->stream);
 
-    bfdev_log_notice("sync write name: %s\n", sync->filename);
+    bfdev_log_notice("sync write name: '%s'\n", sync->filename);
     data += retlen;
     length -= retlen;
 
@@ -1346,6 +1578,8 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     }
 
     syncmsg = bfdev_array_data(&service->stream, 0);
+    BFDEV_BUG_ON(!syncmsg);
+
     sync->cmd = bfdev_le32_to_cpu(syncmsg->id);
     sync->namelen = bfdev_le32_to_cpu(syncmsg->namelen);
     bfdev_array_reset(&service->stream);
@@ -1423,7 +1657,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
         BFENV_IOTHREAD_SIGREAD);
     if (!sync->fileio) {
         bfdev_log_err("sync open: failed to create iothread\n");
-        return NULL;
+        return BFDEV_ERR_PTR(-BFDEV_EFAULT);
     }
 
     sync->event.fd = sync->fileio->eventfd;
@@ -1433,7 +1667,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     retval = bfenv_eproc_event_add(sync->service.sctx->eproc, &sync->event);
     if (retval < 0) {
         bfdev_log_err("sync open: failed to add event\n");
-        return NULL;
+        return BFDEV_ERR_PTR(-BFDEV_EFAULT);
     }
 
     psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
@@ -1449,7 +1683,7 @@ static const struct {
     struct sdbd_service *(*open)(struct sdbd_ctx *sctx, char *cmdline);
 } services[] = {
     {
-        .name = "shell:",
+        .name = "shell",
         .open = service_shell_open,
     }, {
         .name = "reboot:",
@@ -1491,10 +1725,10 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
             continue;
 
         cmdline += length;
-        if (!*cmdline)
-            cmdline = NULL;
-
         service = services[index].open(sctx, cmdline);
+        if (!service)
+            break;
+
         if (BFDEV_IS_INVAL(service))
             return BFDEV_PTR_INVAL(service);
 
@@ -1587,6 +1821,26 @@ service_close_all(struct sdbd_ctx *sctx)
 }
 
 static int
+parse_connect(struct sdbd_ctx *sctx, uint8_t *payload)
+{
+    uint32_t version, max_payload;
+
+    version = sctx->args[0];
+    max_payload = sctx->args[1];
+
+    bfdev_min_adj(version, ADB_VERSION);
+    bfdev_min_adj(max_payload, MAX_PAYLOAD_V2);
+
+    bfdev_log_info("parse connect: version %d payload %d\n",
+        version, max_payload);
+
+    sctx->version = version;
+    sctx->max_payload = max_payload;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 {
     int retval;
@@ -1594,13 +1848,18 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
     bfdev_log_info("handled packet: %c%c%c%c (%u %u) length %u\n",
         (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
         (cmd >> 24) & 0xff, sctx->args[0], sctx->args[1], sctx->length);
-    bfdev_log_debug("packet payload: %s\n", payload);
+    bfdev_log_debug("packet payload: '%s'\n", payload);
 
     switch (cmd) {
         case PCMD_CNXN:
+            retval = parse_connect(sctx, payload);
+            if (retval < 0)
+                return retval;
+
             retval = send_connect(sctx);
             if (retval < 0)
                 return retval;
+
             bfdev_log_notice("usb connected\n");
             break;
 
@@ -1638,7 +1897,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 static int
 adb_usb_recv_handle(struct sdbd_ctx *sctx)
 {
-    uint8_t payload[MAX_PAYLOAD + 1];
+    uint8_t payload[MAX_PAYLOAD_V2 + 1];
     int retval;
 
     sctx->command = bfdev_le32_to_cpu(sctx->msgbuff.command);
@@ -1649,7 +1908,7 @@ adb_usb_recv_handle(struct sdbd_ctx *sctx)
     sctx->check = bfdev_le32_to_cpu(sctx->msgbuff.cksum);
 
     /* check header */
-    if (sctx->command != ~sctx->magic || sctx->length > MAX_PAYLOAD) {
+    if (sctx->command != ~sctx->magic || sctx->length > sctx->max_payload) {
         bfdev_log_err("usb recv: packet header format error\n");
         return -BFDEV_EBADMSG;
     }
@@ -1830,7 +2089,7 @@ usb_init(struct sdbd_ctx *sctx)
 
     sctx->fd_ctr = open(USB_FFS_ADB_CTL, O_RDWR);
     if (sctx->fd_ctr < 0) {
-        bfdev_log_err("open usb control failed: %s\n", USB_FFS_ADB_CTL);
+        bfdev_log_err("open usb control failed: '%s'\n", USB_FFS_ADB_CTL);
         return -BFDEV_EACCES;
     }
 
@@ -1840,13 +2099,13 @@ usb_init(struct sdbd_ctx *sctx)
 
     sctx->fd_out = open(USB_FFS_ADB_OUT, O_RDONLY);
     if (sctx->fd_out < 0) {
-        bfdev_log_err("open usb out failed: %s\n", USB_FFS_ADB_OUT);
+        bfdev_log_err("open usb out failed: '%s'\n", USB_FFS_ADB_OUT);
         return -BFDEV_EACCES;
     }
 
     sctx->fd_in = open(USB_FFS_ADB_IN, O_WRONLY);
     if (sctx->fd_in < 0) {
-        bfdev_log_err("open usb in failed: %s\n", USB_FFS_ADB_IN);
+        bfdev_log_err("open usb in failed: '%s'\n", USB_FFS_ADB_IN);
         return -BFDEV_EACCES;
     }
 
@@ -1922,7 +2181,7 @@ sdbd_exception(int error)
 
     if (!bfdev_errname(error, &einfo))
         einfo = "Unknow error";
-    bfdev_log_crit("critical exception [%d]: %s\n", error, einfo);
+    bfdev_log_crit("critical exception [%d]: '%s'\n", error, einfo);
 
     return error;
 }
@@ -1991,6 +2250,9 @@ sdbd(void)
         bfdev_log_err("usb initialization failed\n");
         goto error;
     }
+
+    sctx.version = ADB_VERSION;
+    sctx.max_payload = MAX_PAYLOAD;
 
     for (;;) {
         retval = bfenv_eproc_run(sctx.eproc, BFENV_TIMEOUT_MAX);
@@ -2080,7 +2342,7 @@ spawn_daemon(void)
 static __bfdev_noreturn void
 usage(const char *path)
 {
-    fprintf(stderr, "Usage: %s [option] ...\n", path);
+    fprintf(stderr, "Usage: '%s' [option] ...\n", path);
     fprintf(stderr, "Simple Debug Bridge Daemon (SDBD) " SDBD_VERSION "\n");
 
     fprintf(stderr, "\n");
@@ -2111,7 +2373,7 @@ usage(const char *path)
 static __bfdev_noreturn void
 version(void)
 {
-    fprintf(stderr, "sdbd version: %s\n", SDBD_INFO);
+    fprintf(stderr, "sdbd version: '%s'\n", SDBD_INFO);
     exit(1);
 }
 
@@ -2148,7 +2410,7 @@ main(int argc, char *const argv[])
             case 'l':
                 value = strtoul(optarg, NULL, 10);
                 if (!isdigit(*optarg) || value > BFDEV_LEVEL_DEBUG) {
-                    fprintf(stderr, "Invalid loglevel value: %s\n", optarg);
+                    fprintf(stderr, "Invalid loglevel value: '%s'\n", optarg);
                     usage(argv[0]);
                 }
                 bfdev_log_default.record_level = value;
@@ -2157,7 +2419,7 @@ main(int argc, char *const argv[])
             case 't':
                 value = strtoul(optarg, NULL, 10);
                 if (!isdigit(*optarg)) {
-                    fprintf(stderr, "Invalid timeout value: %s\n", optarg);
+                    fprintf(stderr, "Invalid timeout value: '%s'\n", optarg);
                     usage(argv[0]);
                 }
                 sdbd_timeout = value * 1000;
