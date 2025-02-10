@@ -53,10 +53,10 @@
 /* ADB Version */
 #define ADB_VERSION 0x1000000
 #define ADB_DEVICE_BANNER "device"
-#define MAX_PAYLOAD (4 * 1024)
-#define MAX_PAYLOAD_V2 (256 * 1024)
-#define SYNC_MAXNAME 1024
-#define SYNC_MAXDATA (64 * 1024)
+#define MAX_PAYLOAD BFDEV_SZ_4KiB
+#define MAX_PAYLOAD_V2 BFDEV_SZ_256KiB
+#define SYNC_MAXNAME BFDEV_SZ_1KiB
+#define SYNC_MAXDATA BFDEV_SZ_64KiB
 
 /* ADB Command */
 #define PCMD_CNXN 0x4e584e43
@@ -319,8 +319,9 @@ struct sdbd_sync_service {
     int fd;
 
     size_t inprogress;
+    size_t batch;
     char filename[SYNC_MAXNAME + 1];
-    uint8_t buff[SYNC_MAXDATA];
+    uint8_t buff[MAX_PAYLOAD_V2];
 };
 
 struct sdbd_ctx {
@@ -1158,6 +1159,44 @@ done:
 }
 
 static int
+sync_recv_batch_write(struct sdbd_sync_service *sync, void *data, size_t size)
+{
+    struct sync_data syncmsg;
+    size_t xfer, total;
+    void *batch;
+    int retval;
+
+    BFDEV_BUG_ON(bfdev_array_size(&sync->service.stream));
+    for (; (xfer = bfdev_min(size, SYNC_MAXDATA)); size -= xfer) {
+        syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DATA);
+        syncmsg.size = bfdev_cpu_to_le32(xfer);
+
+        retval = stream_append(&sync->service, &syncmsg, sizeof(syncmsg));
+        if (retval < 0)
+            return retval;
+
+        retval = stream_append(&sync->service, data, xfer);
+        if (retval < 0)
+            return retval;
+
+        data += xfer;
+    }
+
+    batch = bfdev_array_data(&sync->service.stream, 0);
+    total = bfdev_array_size(&sync->service.stream);
+    BFDEV_BUG_ON(!batch);
+
+    retval = send_datas(sync->service.sctx, sync->service.local,
+        sync->service.remote, batch, total);
+    if (retval < 0)
+        return retval;
+
+    bfdev_array_reset(&sync->service.stream);
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 {
     struct sdbd_sync_service *sync;
@@ -1196,7 +1235,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
             BFDEV_BUG();
     }
 
-    bfdev_log_debug("sync recv handled: remaining %zd\n", request.size);
+    bfdev_log_debug("sync recv handled: readed %zd\n", request.size);
     if (!request.size) {
         syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DONE);
         syncmsg.size = bfdev_cpu_to_le32(0);
@@ -1213,21 +1252,12 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_ENOERR;
     }
 
-    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_DATA);
-    syncmsg.size = bfdev_cpu_to_le32(request.size);
-
-    retval = send_data(sync->service.sctx, sync->service.local,
-        sync->service.remote, &syncmsg, sizeof(syncmsg));
-    if (retval < 0)
-        return retval;
-
-    retval = send_datas(sync->service.sctx, sync->service.local,
-        sync->service.remote, request.buffer, request.size);
+    retval = sync_recv_batch_write(sync, &sync->buff, request.size);
     if (retval < 0)
         return retval;
 
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
-        &sync->buff, sizeof(sync->buff));
+        &sync->buff, sync->batch);
     if (retval < 0)
         return retval;
 
@@ -1237,6 +1267,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 static int
 service_sync_recv(struct sdbd_sync_service *sync, char *filename)
 {
+    size_t slots, combine;
     int retval;
 
     sync->fd = open(filename, O_RDONLY);
@@ -1246,9 +1277,13 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
         return -BFDEV_EACCES;
     }
 
+    slots = BFDEV_DIV_ROUND_UP(sync->service.sctx->max_payload, SYNC_MAXDATA);
+    combine = sync->service.sctx->max_payload - sizeof(struct sync_data) * slots;
+    sync->batch = bfdev_max(combine, SYNC_MAXDATA);
+
     sync->event.func = service_sync_recv_handle;
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
-        &sync->buff, sizeof(sync->buff));
+        &sync->buff, sync->batch);
     if (retval < 0)
         return retval;
 
@@ -2021,7 +2056,7 @@ sdbd_usb_in_handle(bfenv_eproc_event_t *event, void *pdata)
             if (request.error == ESHUTDOWN)
                 return -BFDEV_ESHUTDOWN;
 
-            bfdev_log_err("usb handled: error %d\n", request.error);
+            bfdev_log_err("usb in handled: error %d\n", request.error);
             return -BFDEV_EFAULT;
         }
 
@@ -2342,7 +2377,7 @@ spawn_daemon(void)
 static __bfdev_noreturn void
 usage(const char *path)
 {
-    fprintf(stderr, "Usage: '%s' [option] ...\n", path);
+    fprintf(stderr, "Usage: %s [option] ...\n", path);
     fprintf(stderr, "Simple Debug Bridge Daemon (SDBD) " SDBD_VERSION "\n");
 
     fprintf(stderr, "\n");
@@ -2373,7 +2408,7 @@ usage(const char *path)
 static __bfdev_noreturn void
 version(void)
 {
-    fprintf(stderr, "sdbd version: '%s'\n", SDBD_INFO);
+    fprintf(stderr, "sdbd version: %s\n", SDBD_INFO);
     exit(1);
 }
 

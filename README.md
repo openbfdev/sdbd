@@ -45,7 +45,7 @@ ADBD speed:
 
 ![adbd-speed](./docs/adbd-speed.png)
 
-**SDBD is ten times the speed of ADBD.**
+**SDBD is 14.2 times the speed of ADBD.**
 
 ## How to use
 
