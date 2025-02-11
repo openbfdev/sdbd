@@ -283,7 +283,6 @@ struct sdbd_packet {
     uint32_t length;
     uint32_t cksum;
     uint32_t magic;
-    uint8_t payload[MAX_PAYLOAD_V2];
 };
 
 struct sdbd_service {
@@ -464,7 +463,7 @@ async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
 }
 
 static int
-write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet)
+write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
 {
     struct adb_message message;
     int retval;
@@ -482,14 +481,50 @@ write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet)
         return retval;
 
     if (packet->length) {
+        BFDEV_BUG_ON(!payload);
         bfdev_log_debug("usbio write: payload\n");
-        retval = async_usb_write(sctx, packet->payload, packet->length);
+        retval = async_usb_write(sctx, payload, packet->length);
         if (retval < 0)
             return retval;
     }
 
     return -BFDEV_ENOERR;
 }
+
+#if __ARM_NEON
+# include <arm_neon.h>
+
+static uint32_t
+payload_cksum(uint8_t *payload, size_t length)
+{
+    uint32_t cksum;
+
+    cksum = 0;
+    while (length && !bfdev_align_ptr_check(payload, 16)) {
+        cksum += *payload++;
+        length--;
+    }
+
+    for (; length >= 16; length -= 16, payload += 16) {
+        uint32x4_t data32;
+        uint16x8_t data16;
+        uint8x16_t data8;
+
+        data8 = vld1q_u8(payload);
+        data16 = vpaddlq_u8(data8);
+        data32 = vpaddlq_u16(data16);
+
+        cksum += vgetq_lane_u32(data32, 0) + vgetq_lane_u32(data32, 1) +
+            vgetq_lane_u32(data32, 2) + vgetq_lane_u32(data32, 3);
+    }
+
+    for (; length; --length)
+        cksum += *payload++;
+
+    return cksum;
+}
+
+#else /* Generic */
 
 static uint32_t
 payload_cksum(uint8_t *payload, size_t length)
@@ -503,18 +538,21 @@ payload_cksum(uint8_t *payload, size_t length)
     return cksum;
 }
 
+#endif
+
 static int
-send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet)
+send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
 {
     uint32_t cksum, magic;
 
-    cksum = payload_cksum(packet->payload, packet->length);
+    BFDEV_BUG_ON(packet->length && !payload);
+    cksum = payload_cksum(payload, packet->length);
     magic = ~packet->command;
 
     packet->cksum = cksum;
     packet->magic = magic;
 
-    return write_packet(sctx, packet);
+    return write_packet(sctx, packet, payload);
 }
 
 static size_t
@@ -541,6 +579,7 @@ make_connect_data(char *buff, size_t bsize)
 static int
 send_connect(struct sdbd_ctx *sctx)
 {
+    uint8_t payload[MAX_PAYLOAD_V2];
     struct sdbd_packet packet;
     size_t length;
     int retval;
@@ -549,14 +588,14 @@ send_connect(struct sdbd_ctx *sctx)
     packet.args[0] = sctx->version;
     packet.args[1] = sctx->max_payload;
 
-    length = make_connect_data((char *)packet.payload, sizeof(packet.payload));
+    length = make_connect_data((char *)payload, sizeof(payload));
     if (length > MAX_PAYLOAD)
         bfdev_log_warn("send connect: banner too large\n");
 
-    bfdev_log_info("send connect: '%s'\n", packet.payload);
+    bfdev_log_info("send connect: '%s'\n", payload);
     packet.length = length;
 
-    retval = send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet, payload);
     if (retval < 0)
         return retval;
 
@@ -575,7 +614,7 @@ send_close(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
     packet.length = 0;
 
     bfdev_log_info("send close: local %u remote %u\n", local, remote);
-    retval = send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet, NULL);
     if (retval < 0)
         return retval;
 
@@ -594,7 +633,7 @@ send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
     packet.length = 0;
 
     bfdev_log_info("send okay: local %u remote %u\n", local, remote);
-    retval = send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet, NULL);
     if (retval < 0)
         return retval;
 
@@ -602,7 +641,8 @@ send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
 }
 
 static int
-send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size)
+send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
+          void *data, size_t size)
 {
     struct sdbd_packet packet;
     int retval;
@@ -610,13 +650,11 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, si
     packet.command = PCMD_WRTE;
     packet.args[0] = local;
     packet.args[1] = remote;
-
     packet.length = size;
-    memcpy(packet.payload, data, size);
 
     bfdev_log_debug("send data: local %u remote %u size %zu\n",
         local, remote, size);
-    retval = send_packet(sctx, &packet);
+    retval = send_packet(sctx, &packet, data);
     if (retval < 0)
         return retval;
 
@@ -624,7 +662,8 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, si
 }
 
 static int
-send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size)
+send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
+           void *data, size_t size)
 {
     size_t xfer;
     int retval;
@@ -655,7 +694,8 @@ stream_append(struct sdbd_service *service, void *data, size_t size)
 }
 
 static ssize_t
-stream_accumulate(struct sdbd_service *service, size_t request, void *data, size_t append)
+stream_accumulate(struct sdbd_service *service, size_t request,
+                  void *data, size_t append)
 {
     size_t alreary, remain, avail;
     int retval;

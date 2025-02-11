@@ -19,7 +19,7 @@
 - [x] Shell command
 - [x] Reboot command
 - [x] Remount command
-- [x] File sync commands (push pull)
+- [x] Arm NEON HW acceleration
 
 ### Support commands
 
