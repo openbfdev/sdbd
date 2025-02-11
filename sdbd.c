@@ -8,6 +8,7 @@
 #include <unistd.h>
 #include <getopt.h>
 #include <err.h>
+#include <pwd.h>
 #include <errno.h>
 #include <signal.h>
 #include <fcntl.h>
@@ -679,41 +680,49 @@ static pid_t
 spawn_shell(struct sdbd_shell_service *shell, int *amaster,
             const char *path, char *cmdline)
 {
+    char ptsname[PATH_MAX];
+    struct passwd *pwd;
+    int child;
     pid_t pid;
     char *value;
-    int retval;
 
-    pid = forkpty(amaster, NULL, NULL, NULL);
+    pid = forkpty(amaster, ptsname, NULL, NULL);
     if (pid != 0)
         return pid;
+
+    /* Subprocess child. */
+    setsid();
+    clearenv();
+
+    child = open(ptsname, O_RDWR | O_CLOEXEC);
+    if (child < 0)
+        exit(child);
+
+    dup2(child, STDIN_FILENO);
+    dup2(child, STDOUT_FILENO);
+    dup2(child, STDERR_FILENO);
+
+    pwd = getpwuid(getuid());
+    if (pwd) {
+        chdir(pwd->pw_dir);
+        setenv("HOME", pwd->pw_dir, 0);
+        setenv("USER", pwd->pw_name, 0);
+        setenv("LOGNAME", pwd->pw_name, 0);
+        setenv("SHELL", pwd->pw_shell, 0);
+    }
 
     value = NULL;
     if (shell->v2 && shell->term)
         value = shell->term;
-
     if (!value)
         value = getenv("TERM");
-
     if (!value)
         value = "xterm-256color";
+    setenv("TERM", value, 0);
 
-    retval = setenv("TERM", value, 0);
-    if (retval < 0)
-        exit(retval);
-
-    value = getenv("HOME");
-    if (value) {
-        retval = chdir(value);
-        if (retval < 0)
-            exit(retval);
-    }
-
-    retval = execl(path, path, cmdline ? "-c" : NULL, cmdline, NULL);
-    if (retval < 0)
-        exit(retval);
-
-    /* should never come here */
-    BFDEV_BUG();
+    signal(SIGPIPE, SIG_DFL);
+    execl(path, path, cmdline ? "-c" : "-", cmdline, NULL);
+    exit(1);
 }
 
 static void
@@ -727,6 +736,7 @@ service_shell_close(struct sdbd_service *service)
     kill(shell->pid, SIGKILL);
 
     bfenv_eproc_event_remove(service->sctx->eproc, &shell->event);
+    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     close(shell->event.fd);
 
     bfdev_radix_free(&service->sctx->services, service->local);
@@ -760,7 +770,7 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
 
             switch (shell->cmd) {
                 case SHELL_CMD_STDIN:
-                    retval = sdbd_write(shell->event.fd, data, length);
+                    retval = sdbd_write(shell->event.fd, data, size);
                     if (retval < 0)
                         return retval;
                     break;
@@ -989,7 +999,7 @@ service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
     char buff[MAX_PAYLOAD_V2];
 
     bfdev_log_notice("reboot open: cmdline '%s'\n", cmdline);
-    bfdev_scnprintf(buff, sizeof(buff), "reboot '%s'", cmdline);
+    bfdev_scnprintf(buff, sizeof(buff), ":reboot '%s'", cmdline);
     service = service_shell_open(sctx, buff);
     if (!service)
         return NULL;
@@ -1003,7 +1013,7 @@ service_remount_open(struct sdbd_ctx *sctx, char *cmdline)
     struct sdbd_service *service;
 
     bfdev_log_notice("remount open\n");
-    service = service_shell_open(sctx, "mount -o remount,rw /system");
+    service = service_shell_open(sctx, ":mount -o remount,rw /system");
     if (!service)
         return NULL;
 
@@ -1022,7 +1032,8 @@ service_sync_close(struct sdbd_service *service)
     if (sync->fd > 0)
         close(sync->fd);
 
-    bfenv_eproc_event_remove(sync->service.sctx->eproc, &sync->event);
+    bfenv_eproc_event_remove(service->sctx->eproc, &sync->event);
+    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfenv_iothread_destory(sync->fileio);
 
     bfdev_array_release(&service->stream);
@@ -1456,7 +1467,7 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode, void
         sync->fd = open(filename, O_WRONLY | O_NONBLOCK, mode);
     }
 
-    if (sync->fd < 0) {
+    if (sync->fd > 0) {
         bfdev_log_err("sync send file: failed to open file '%s' error %d\n",
             filename, errno);
 
@@ -1806,18 +1817,18 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
     service = *psrv;
     remote = service->remote;
 
+    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
+    retval = bfenv_eproc_timer_add(sctx->eproc, &service->timer,
+        sdbd_timeout);
+    if (retval < 0)
+        return retval;
+
     /* service could close in write */
     retval = service->write(service, payload, sctx->length);
     if (retval < 0)
         return retval;
 
     retval = send_okay(sctx, local, remote);
-    if (retval < 0)
-        return retval;
-
-    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
-    retval = bfenv_eproc_timer_add(sctx->eproc, &service->timer,
-        sdbd_timeout);
     if (retval < 0)
         return retval;
 
@@ -1838,7 +1849,6 @@ service_close(struct sdbd_ctx *sctx)
     }
 
     service = *psrv;
-    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
     service->close(service);
 }
 
