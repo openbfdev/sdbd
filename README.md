@@ -54,7 +54,8 @@ Usage:
 ```shell
 $ sdbd --help
 Usage: ./sdbd [option] ...
-Simple Debug Bridge Daemon (SDBD) v0.1
+Simple Debug Bridge Daemon (SDBD) v0.2
+Hardware Acceleration: 'Arm Neon'
 
 Options:
   -h, --help            Display this information.
