@@ -2423,6 +2423,12 @@ error:
 }
 
 static int
+log_redirect(bfdev_log_message_t *msg, void *pdata)
+{
+    return write((int)(uintptr_t)pdata, msg->buff, msg->length);
+}
+
+static int
 spawn_daemon(void)
 {
     pid_t pid;
@@ -2431,7 +2437,7 @@ spawn_daemon(void)
     pid = fork();
     switch (pid) {
         case -1:
-            bfdev_log_err("failed to fork daemon\n");
+            fprintf(stderr, "failed to fork daemon\n");
             return -BFDEV_EFAULT;
 
         case 0:
@@ -2443,22 +2449,22 @@ spawn_daemon(void)
 
     fd = open("/dev/null", O_RDWR);
     if (fd < 0) {
-        bfdev_log_err("failed to open null\n");
+        fprintf(stderr, "failed to open null\n");
         return -BFDEV_ENXIO;
     }
 
     if (dup2(fd, STDIN_FILENO) < 0) {
-        bfdev_log_err("failed to dup stdin\n");
+        fprintf(stderr, "failed to dup stdin\n");
         return -BFDEV_ENXIO;
     }
 
     if (dup2(fd, STDOUT_FILENO) < 0) {
-        bfdev_log_err("failed to dup stdout\n");
+        fprintf(stderr, "failed to dup stdout\n");
         return -BFDEV_ENXIO;
     }
 
     if (dup2(fd, STDERR_FILENO) < 0) {
-        bfdev_log_err("failed to dup stdout\n");
+        fprintf(stderr, "failed to dup stdout\n");
         return -BFDEV_ENXIO;
     }
 
@@ -2477,6 +2483,7 @@ usage(const char *path)
     fprintf(stderr, "  -h, --help            Display this information.\n");
     fprintf(stderr, "  -v, --version         Display version information.\n");
     fprintf(stderr, "  -d, --daemon          Run in daemon mode.\n");
+    fprintf(stderr, "  -f, --logfile=PATH    Redirect logs to file.\n");
     fprintf(stderr, "  -l, --loglevel=LEVEL  Set print log level threshold.\n");
     fprintf(stderr, "  -t, --timout=SECONDS  Set service idle timeout value.\n");
 
@@ -2509,6 +2516,7 @@ options[] = {
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'v'},
     {"daemon", no_argument, NULL, 'd'},
+    {"logfile", required_argument, NULL, 'f'},
     {"loglevel", required_argument, NULL, 'l'},
     {"timeout", required_argument, NULL, 't'},
     { }, /* NULL */
@@ -2518,20 +2526,33 @@ int
 main(int argc, char *const argv[])
 {
     unsigned long value;
-    int arg, optidx;
+    int arg, optidx, logfd;
     int retval;
 
+    logfd = -1;
     sdbd_daemon = false;
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdl:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdf:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
         switch (arg) {
             case 'd':
                 sdbd_daemon = true;
+                break;
+
+            case 'f':
+                logfd = open(optarg, O_CREAT | O_WRONLY | O_APPEND, 0644);
+                if (logfd < 0) {
+                    fprintf(stderr, "Failed to open log file: '%s'\n", optarg);
+                    usage(argv[0]);
+                }
+
+                bfdev_log_default.write = log_redirect;
+                bfdev_log_default.pdata = (void *)(uintptr_t)logfd;
+                bfdev_log_color_clr(&bfdev_log_default);
                 break;
 
             case 'l':
@@ -2574,5 +2595,12 @@ main(int argc, char *const argv[])
             return retval;
     }
 
-    return sdbd();
+    retval = sdbd();
+    if (retval < 0)
+        return retval;
+
+    if (logfd > 0)
+        close(logfd);
+
+    return 0;
 }
