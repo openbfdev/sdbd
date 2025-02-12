@@ -19,7 +19,7 @@
 - [x] Shell command
 - [x] Reboot command
 - [x] Remount command
-- [x] Arm NEON HW acceleration
+- [x] Intel SSE2 / Arm NEON HW acceleration
 
 ### Support commands
 
