@@ -494,6 +494,9 @@ write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
 #if __ARM_NEON
 # include <arm_neon.h>
 
+static const char
+hardware_accel[] = "Arm Neon";
+
 static uint32_t
 payload_cksum(uint8_t *payload, size_t length)
 {
@@ -527,6 +530,9 @@ payload_cksum(uint8_t *payload, size_t length)
 #elif __SSE2__
 # include <x86intrin.h>
 
+static const char
+hardware_accel[] = "Intel SSE2";
+
 static uint32_t
 payload_cksum(uint8_t *payload, size_t length)
 {
@@ -557,6 +563,9 @@ payload_cksum(uint8_t *payload, size_t length)
 }
 
 #else /* Generic */
+
+static const char
+hardware_accel[] = "None";
 
 static uint32_t
 payload_cksum(uint8_t *payload, size_t length)
@@ -2461,6 +2470,7 @@ usage(const char *path)
 {
     fprintf(stderr, "Usage: %s [option] ...\n", path);
     fprintf(stderr, "Simple Debug Bridge Daemon (SDBD) " SDBD_VERSION "\n");
+    fprintf(stderr, "Hardware Acceleration: '%s'\n", hardware_accel);
 
     fprintf(stderr, "\n");
     fprintf(stderr, "Options:\n");
