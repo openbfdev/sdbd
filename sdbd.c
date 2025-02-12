@@ -761,9 +761,10 @@ static pid_t
 spawn_shell(struct sdbd_shell_service *shell, int *amaster,
             const char *path, char *cmdline)
 {
-    char ptsname[PATH_MAX];
+    char ptsname[PATH_MAX], hostname[HOST_NAME_MAX];
     struct passwd *pwd;
-    int child;
+    int child, fd, maxfd;
+    int retval;
     pid_t pid;
     char *value;
 
@@ -773,15 +774,23 @@ spawn_shell(struct sdbd_shell_service *shell, int *amaster,
 
     /* Subprocess child. */
     setsid();
-    clearenv();
 
-    child = open(ptsname, O_RDWR | O_CLOEXEC);
+    child = open(ptsname, O_RDWR);
     if (child < 0)
         exit(child);
 
     dup2(child, STDIN_FILENO);
     dup2(child, STDOUT_FILENO);
     dup2(child, STDERR_FILENO);
+
+    /* close the all fds except stdio */
+    maxfd = sysconf(_SC_OPEN_MAX);
+    for (fd = STDERR_FILENO + 1; fd < maxfd; ++fd)
+        close(fd);
+
+    retval = gethostname(hostname, sizeof(hostname));
+    if (retval >= 0 && strcmp(hostname, "localhost"))
+        setenv("HOSTNAME", hostname, 0);
 
     pwd = getpwuid(getuid());
     if (pwd) {
@@ -801,7 +810,10 @@ spawn_shell(struct sdbd_shell_service *shell, int *amaster,
         value = "xterm-256color";
     setenv("TERM", value, 0);
 
-    signal(SIGPIPE, SIG_DFL);
+    /* sdbd ignored sigint and sigchld */
+    signal(SIGINT, SIG_DFL);
+    signal(SIGCHLD, SIG_DFL);
+
     execl(path, path, cmdline ? "-c" : "-", cmdline, NULL);
     exit(1);
 }
