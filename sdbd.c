@@ -518,7 +518,39 @@ payload_cksum(uint8_t *payload, size_t length)
             vgetq_lane_u32(data32, 2) + vgetq_lane_u32(data32, 3);
     }
 
-    for (; length; --length)
+    while (length--)
+        cksum += *payload++;
+
+    return cksum;
+}
+
+#elif __SSE2__
+# include <x86intrin.h>
+
+static uint32_t
+payload_cksum(uint8_t *payload, size_t length)
+{
+    uint32_t cksum;
+    __m128i sum;
+
+    cksum = 0;
+    while (length && !bfdev_align_ptr_check(payload, 16)) {
+        cksum += *payload++;
+        length--;
+    }
+
+    sum = _mm_setzero_si128();
+    for (; length >= 16; length -= 16, payload += 16) {
+        __m128i data;
+
+        data = _mm_load_si128((const __m128i *)payload);
+        sum = _mm_add_epi32(sum, _mm_sad_epu8(data, _mm_setzero_si128()));
+    }
+
+    sum = _mm_add_epi32(sum, _mm_srli_si128(sum, 8));
+    cksum += _mm_cvtsi128_si32(sum);
+
+    while (length--)
         cksum += *payload++;
 
     return cksum;
