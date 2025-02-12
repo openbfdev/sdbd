@@ -61,6 +61,7 @@ Options:
   -h, --help            Display this information.
   -v, --version         Display version information.
   -d, --daemon          Run in daemon mode.
+  -f, --logfile=PATH    Redirect logs to file.
   -l, --loglevel=LEVEL  Set print log level threshold.
   -t, --timout=SECONDS  Set service idle timeout value.
 
