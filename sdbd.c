@@ -183,8 +183,8 @@ struct adb_endpoint_descriptor_no_audio {
 
 static const struct {
     struct adb_functionfs_descs_head header;
-	bfdev_le32 fs_count;
-	bfdev_le32 hs_count;
+    bfdev_le32 fs_count;
+    bfdev_le32 hs_count;
     struct {
         struct usb_interface_descriptor intf;
         struct adb_endpoint_descriptor_no_audio source;
@@ -194,7 +194,7 @@ static const struct {
     .header = {
         .magic = bfdev_cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
         .length = bfdev_cpu_to_le32(sizeof(adb_desc)),
-		.flags = bfdev_cpu_to_le32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC),
+        .flags = bfdev_cpu_to_le32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC),
     },
     .fs_count = bfdev_cpu_to_le32(3),
     .hs_count = bfdev_cpu_to_le32(3),
