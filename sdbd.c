@@ -1548,7 +1548,7 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode, void
         sync->fd = open(filename, O_WRONLY | O_NONBLOCK, mode);
     }
 
-    if (sync->fd > 0) {
+    if (sync->fd < 0) {
         bfdev_log_err("sync send file: failed to open file '%s' error %d\n",
             filename, errno);
 
