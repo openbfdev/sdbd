@@ -28,7 +28,7 @@
 #define MODULE_NAME "sdbd"
 #define bfdev_log_fmt(fmt) MODULE_NAME ": " fmt
 
-#define SDBD_VERSION "v0.2"
+#define SDBD_VERSION "v0.3"
 #define SDBD_INFO MODULE_NAME "/" SDBD_VERSION
 
 #ifndef DEBUG
@@ -54,7 +54,7 @@
 /* ADB Version */
 #define ADB_VERSION 0x1000000
 #define ADB_DEVICE_BANNER "device"
-#define MAX_PAYLOAD BFDEV_SZ_4KiB
+#define MAX_PAYLOAD_V1 BFDEV_SZ_4KiB
 #define MAX_PAYLOAD_V2 BFDEV_SZ_256KiB
 #define SYNC_MAXNAME BFDEV_SZ_1KiB
 #define SYNC_MAXDATA BFDEV_SZ_64KiB
@@ -91,8 +91,20 @@
 #define SHELL_CMD_WINSIZE 5
 
 /* SDBD Configuration */
-#define USB_FIFO_DEEPTH 64
-#define SYNC_FIFO_DEEPTH 32
+#ifdef PROFILE_SMALL
+# define USB_FIFO_DEEPTH 4
+# define MAX_PAYLOAD MAX_PAYLOAD_V1
+#endif
+
+#ifndef USB_FIFO_DEEPTH
+# define USB_FIFO_DEEPTH 64
+#endif
+
+#ifndef MAX_PAYLOAD
+# define MAX_PAYLOAD MAX_PAYLOAD_V2
+#endif
+
+#define SYNC_FIFO_DEEPTH 2
 #define SERVICE_TIMEOUT (12 * 60 * 60 * 1000)
 #define ASYNC_IOWAIT_TIME 1000
 
@@ -321,7 +333,7 @@ struct sdbd_sync_service {
     size_t inprogress;
     size_t batch;
     char filename[SYNC_MAXNAME + 1];
-    uint8_t buff[MAX_PAYLOAD_V2];
+    uint8_t buff[];
 };
 
 struct sdbd_ctx {
@@ -620,7 +632,7 @@ make_connect_data(char *buff, size_t bsize)
 static int
 send_connect(struct sdbd_ctx *sctx)
 {
-    uint8_t payload[MAX_PAYLOAD_V2];
+    uint8_t payload[MAX_PAYLOAD];
     struct sdbd_packet packet;
     size_t length;
     int retval;
@@ -630,7 +642,7 @@ send_connect(struct sdbd_ctx *sctx)
     packet.args[1] = sctx->max_payload;
 
     length = make_connect_data((char *)payload, sizeof(payload));
-    if (length > MAX_PAYLOAD)
+    if (length > MAX_PAYLOAD_V1)
         bfdev_log_warn("send connect: banner too large\n");
 
     bfdev_log_info("send connect: '%s'\n", payload);
@@ -755,6 +767,12 @@ stream_accumulate(struct sdbd_service *service, size_t request,
         return -BFDEV_EAGAIN;
 
     return avail;
+}
+
+static void
+iothread_release(bfenv_iothread_request_t *request, void *pdata)
+{
+    free(request->buffer);
 }
 
 static pid_t
@@ -968,7 +986,7 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
 {
     struct sdbd_shell_service *shell;
     struct shell_data shellmsg;
-    uint8_t buffer[MAX_PAYLOAD_V2];
+    uint8_t buffer[MAX_PAYLOAD];
     ssize_t length;
     int retval;
 
@@ -1089,7 +1107,7 @@ static struct sdbd_service *
 service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
-    char buff[MAX_PAYLOAD_V2];
+    char buff[MAX_PAYLOAD];
 
     bfdev_log_notice("reboot open: cmdline '%s'\n", cmdline);
     bfdev_scnprintf(buff, sizeof(buff), ":reboot '%s'", cmdline);
@@ -1127,7 +1145,7 @@ service_sync_close(struct sdbd_service *service)
 
     bfenv_eproc_event_remove(service->sctx->eproc, &sync->event);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
-    bfenv_iothread_destory(sync->fileio);
+    bfenv_iothread_destory(sync->fileio, iothread_release, NULL);
 
     bfdev_array_release(&service->stream);
     bfdev_radix_free(&service->sctx->services, service->local);
@@ -1371,7 +1389,6 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 static int
 service_sync_recv(struct sdbd_sync_service *sync, char *filename)
 {
-    size_t slots, combine;
     int retval;
 
     sync->fd = open(filename, O_RDONLY);
@@ -1381,11 +1398,9 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
         return -BFDEV_EACCES;
     }
 
-    slots = BFDEV_DIV_ROUND_UP(sync->service.sctx->max_payload, SYNC_MAXDATA);
-    combine = sync->service.sctx->max_payload - sizeof(struct sync_data) * slots;
-    sync->batch = bfdev_max(combine, SYNC_MAXDATA);
-
+    bfdev_log_debug("sync recv: batch size %zd\n", sync->batch);
     sync->event.func = service_sync_recv_handle;
+
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
         &sync->buff, sync->batch);
     if (retval < 0)
@@ -1779,12 +1794,18 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_sync_service *sync;
     struct sdbd_service **psrv;
+    size_t slots, batch;
     int retval;
 
-    sync = bfdev_zalloc(NULL, sizeof(*sync));
+    slots = BFDEV_DIV_ROUND_UP(sctx->max_payload, SYNC_MAXDATA);
+    batch = sctx->max_payload - sizeof(struct sync_data) * slots;
+    bfdev_max_adj(batch, SYNC_MAXDATA);
+
+    sync = bfdev_zalloc(NULL, sizeof(*sync) + batch);
     if (!sync)
         return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
 
+    sync->batch = batch;
     sync->service.sctx = sctx;
     sync->service.remote = sctx->args[0];
     sync->service.local = ++sctx->sockid;
@@ -1967,7 +1988,7 @@ parse_connect(struct sdbd_ctx *sctx, uint8_t *payload)
     max_payload = sctx->args[1];
 
     bfdev_min_adj(version, ADB_VERSION);
-    bfdev_min_adj(max_payload, MAX_PAYLOAD_V2);
+    bfdev_min_adj(max_payload, MAX_PAYLOAD);
 
     bfdev_log_info("parse connect: version %d payload %d\n",
         version, max_payload);
@@ -2035,7 +2056,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 static int
 adb_usb_recv_handle(struct sdbd_ctx *sctx)
 {
-    uint8_t payload[MAX_PAYLOAD_V2 + 1];
+    uint8_t payload[MAX_PAYLOAD + 1];
     int retval;
 
     sctx->command = bfdev_le32_to_cpu(sctx->msgbuff.command);
@@ -2422,8 +2443,8 @@ finish:
     usb_close(&sctx);
     bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_out);
     bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_in);
-    bfenv_iothread_destory(sctx.usbio_out);
-    bfenv_iothread_destory(sctx.usbio_in);
+    bfenv_iothread_destory(sctx.usbio_out, iothread_release, NULL);
+    bfenv_iothread_destory(sctx.usbio_in, iothread_release, NULL);
     bfenv_eproc_destory(sctx.eproc);
     bfdev_log_debug("finish exit\n");
 

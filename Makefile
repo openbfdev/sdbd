@@ -32,6 +32,10 @@ sdbd: sdbd.c
 	$(CROSS_COMPILE)gcc -o $@ $^ -O2 $(SDBD_C_FLAGS)
 	$(CROSS_COMPILE)strip $@
 
+sdbd-small: sdbd.c
+	$(CROSS_COMPILE)gcc -o $@ $^ -O2 -DPROFILE_SMALL $(SDBD_C_FLAGS)
+	$(CROSS_COMPILE)strip $@
+
 sdbd-debug: sdbd.c
 	$(CROSS_COMPILE)gcc -o $@ $^ -O0 $(SDBD_C_DEBUG_FLAGS)
 
