@@ -54,7 +54,7 @@ Usage:
 ```shell
 $ sdbd --help
 Usage: ./sdbd [option] ...
-Simple Debug Bridge Daemon (SDBD) v0.2
+Simple Debug Bridge Daemon (SDBD) v0.3
 Hardware Acceleration: 'Arm Neon'
 
 Options:
@@ -77,6 +77,18 @@ The following optionals are for loglevel:
 
 For bug reporting, please visit:
 <https://github.com/openbfdev/sdbd>
+```
+
+## How to build
+
+The project requires **bfdev** and **bfenv** dependencies.
+Ensure they are installed prior to building.
+
+```shell
+$ make # typical build
+$ make sdbd-small # small memory devices
+$ make sdbd-debug # debug version
+
 ```
 
 ## Reference link
