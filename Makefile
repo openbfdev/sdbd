@@ -17,7 +17,7 @@ debug: sdbd-debug
 PHONY += all debug
 
 clean:
-	rm -rf sdbd sdbd-debug
+	rm -rf sdbd sdbd-small sdbd-debug
 PHONY += all
 
 install: sdbd

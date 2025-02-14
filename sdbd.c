@@ -92,19 +92,19 @@
 
 /* SDBD Configuration */
 #ifdef PROFILE_SMALL
-# define USB_FIFO_DEEPTH 4
+# define USB_FIFO_DEPTH 4
 # define MAX_PAYLOAD MAX_PAYLOAD_V1
 #endif
 
-#ifndef USB_FIFO_DEEPTH
-# define USB_FIFO_DEEPTH 64
+#ifndef USB_FIFO_DEPTH
+# define USB_FIFO_DEPTH 64
 #endif
 
 #ifndef MAX_PAYLOAD
 # define MAX_PAYLOAD MAX_PAYLOAD_V2
 #endif
 
-#define SYNC_FIFO_DEEPTH 2
+#define SYNC_FIFO_DEPTH 2
 #define SERVICE_TIMEOUT (12 * 60 * 60 * 1000)
 #define ASYNC_IOWAIT_TIME 1000
 
@@ -1799,7 +1799,6 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
 
     slots = BFDEV_DIV_ROUND_UP(sctx->max_payload, SYNC_MAXDATA);
     batch = sctx->max_payload - sizeof(struct sync_data) * slots;
-    bfdev_max_adj(batch, SYNC_MAXDATA);
 
     sync = bfdev_zalloc(NULL, sizeof(*sync) + batch);
     if (!sync)
@@ -1813,7 +1812,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     sync->service.close = service_sync_close;
     bfdev_array_init(&sync->service.stream, NULL, sizeof(uint8_t));
 
-    sync->fileio = bfenv_iothread_create(NULL, SYNC_FIFO_DEEPTH,
+    sync->fileio = bfenv_iothread_create(NULL, SYNC_FIFO_DEPTH,
         BFENV_IOTHREAD_SIGREAD);
     if (!sync->fileio) {
         bfdev_log_err("sync open: failed to create iothread\n");
@@ -1987,11 +1986,16 @@ parse_connect(struct sdbd_ctx *sctx, uint8_t *payload)
     version = sctx->args[0];
     max_payload = sctx->args[1];
 
-    bfdev_min_adj(version, ADB_VERSION);
-    bfdev_min_adj(max_payload, MAX_PAYLOAD);
-
     bfdev_log_info("parse connect: version %d payload %d\n",
         version, max_payload);
+
+    if (!max_payload) {
+        bfdev_log_err("parse connect: invalid payload\n");
+        return -BFDEV_EINVAL;
+    }
+
+    bfdev_min_adj(version, ADB_VERSION);
+    bfdev_min_adj(max_payload, MAX_PAYLOAD);
 
     sctx->version = version;
     sctx->max_payload = max_payload;
@@ -2373,7 +2377,7 @@ sdbd(void)
         goto error;
     }
 
-    sctx.usbio_in = bfenv_iothread_create(NULL, USB_FIFO_DEEPTH,
+    sctx.usbio_in = bfenv_iothread_create(NULL, USB_FIFO_DEPTH,
         BFENV_IOTHREAD_SIGWRITE);
     if (!sctx.usbio_in) {
         bfdev_log_err("usbio in iothread create failed\n");

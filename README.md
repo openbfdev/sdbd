@@ -88,8 +88,17 @@ Ensure they are installed prior to building.
 $ make # typical build
 $ make sdbd-small # small memory devices
 $ make sdbd-debug # debug version
-
 ```
+
+## Memory Overhead
+
+SDBD: Transfer 256MiB file
+
+![sdbd-memory](./docs/sdbd-memory.png)
+
+SDBD Small: Transfer 256MiB file
+
+![sdbd-small-memory](./docs/sdbd-small-memory.png)
 
 ## Reference link
 
