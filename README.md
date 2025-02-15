@@ -86,8 +86,9 @@ Ensure they are installed prior to building.
 
 ```shell
 $ make # typical build
-$ make sdbd-small # small memory devices
-$ make sdbd-debug # debug version
+$ make small # small memory device
+$ make reldbg # release debug version
+$ make debug # asan debug version
 ```
 
 ## Memory Overhead
