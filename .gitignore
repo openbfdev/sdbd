@@ -2,4 +2,6 @@
 /.cache
 /compile_commands.json
 /sdbd
+/sdbd-small
+/sdbd-reldbg
 /sdbd-debug
