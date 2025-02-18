@@ -1563,7 +1563,8 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
             continue;
         }
 
-        retlen = stream_accumulate(&sync->service, sizeof(*syncmsg), data, length);
+        retlen = stream_accumulate(&sync->service,
+            sizeof(*syncmsg), data, length);
         if (retlen < 0) {
             if (retlen == -BFDEV_EAGAIN) {
                 bfdev_log_debug("sync send file write: wait header\n");
@@ -1647,7 +1648,8 @@ failed:
 }
 
 static int
-sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode, void *data, size_t length)
+sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode,
+               void *data, size_t length)
 {
     int retval;
 
@@ -1697,23 +1699,28 @@ sync_send_link(struct sdbd_sync_service *sync, char *filename)
 static int
 service_sync_send(struct sdbd_sync_service *sync, char *filename, void *data, size_t length)
 {
+    bool islink, isreg;
     mode_t mode;
     char *flags;
-    bool islink;
     int retval;
 
+    islink = false;
+    isreg = false;
+
     flags = strrchr(filename,',');
-    if (flags) {
+    if (!flags)
+        mode = 0644;
+    else {
         *flags++ = '\0';
         mode = strtoul(flags, NULL, 0);
         islink = S_ISLNK(mode);
+        isreg = S_ISREG(mode);
         mode &= 0777;
     }
 
-    if (!flags || errno) {
-        mode = 0644;
-        islink = 0;
-    }
+    /* delete files before copying if they are regular or symlinks. */
+    if (islink || isreg)
+        unlink(filename);
 
     if (islink) {
         retval = sync_send_link(sync, filename);
