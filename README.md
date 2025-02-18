@@ -11,6 +11,7 @@
 ## Features
 
 - [x] Daemon mode
+- [x] USB 3.2 SuperSpeed+ support
 - [x] Version 2 transmission protocol
 - [x] Shell version 2, can change windows size
 - [x] Automatic timeout close for unresponsive services
