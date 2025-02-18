@@ -50,6 +50,7 @@
 #define ADB_INTERFACE "ADB Interface"
 #define MAX_PACKET_SIZE_FS 64
 #define MAX_PACKET_SIZE_HS 512
+#define MAX_PACKET_SIZE_SS 1024
 
 /* ADB Version */
 #define ADB_VERSION 0x1000000
@@ -193,23 +194,61 @@ struct adb_endpoint_descriptor_no_audio {
     uint8_t bInterval;
 } __bfdev_packed;
 
+struct adb_ss_ep_comp_descriptor {
+    uint8_t bLength;
+    uint8_t bDescriptorType;
+    uint8_t bMaxBurst;
+    uint8_t bmAttributes;
+    bfdev_le16 wBytesPerInterval;
+} __bfdev_packed;
+
+struct adb_os_desc_header {
+    uint8_t interface;
+    bfdev_le32 dwLength;
+    bfdev_le16 bcdVersion;
+    bfdev_le16 wIndex;
+    union {
+        struct {
+            uint8_t bCount;
+            uint8_t Reserved;
+        };
+        bfdev_le16 wCount;
+    };
+} __bfdev_packed;
+
 static const struct {
     struct adb_functionfs_descs_head header;
     bfdev_le32 fs_count;
     bfdev_le32 hs_count;
+    bfdev_le32 ss_count;
+    bfdev_le32 os_count;
     struct {
         struct usb_interface_descriptor intf;
         struct adb_endpoint_descriptor_no_audio source;
         struct adb_endpoint_descriptor_no_audio sink;
     } __bfdev_packed fs_descs, hs_descs;
+    struct {
+        struct usb_interface_descriptor intf;
+        struct adb_endpoint_descriptor_no_audio source;
+        struct adb_ss_ep_comp_descriptor source_comp;
+        struct adb_endpoint_descriptor_no_audio sink;
+        struct adb_ss_ep_comp_descriptor sink_comp;
+    } __bfdev_packed ss_descs;
+    struct adb_os_desc_header os_header;
+    struct usb_ext_compat_desc os_desc;
 } __bfdev_packed adb_desc = {
     .header = {
         .magic = bfdev_cpu_to_le32(FUNCTIONFS_DESCRIPTORS_MAGIC_V2),
         .length = bfdev_cpu_to_le32(sizeof(adb_desc)),
-        .flags = bfdev_cpu_to_le32(FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC),
+        .flags = bfdev_cpu_to_le32(
+            FUNCTIONFS_HAS_FS_DESC | FUNCTIONFS_HAS_HS_DESC |
+            FUNCTIONFS_HAS_SS_DESC | FUNCTIONFS_HAS_MS_OS_DESC
+        ),
     },
     .fs_count = bfdev_cpu_to_le32(3),
     .hs_count = bfdev_cpu_to_le32(3),
+    .ss_count = bfdev_cpu_to_le32(5),
+    .os_count = bfdev_cpu_to_le32(1),
     .fs_descs = {
         .intf = {
             .bLength = sizeof(adb_desc.fs_descs.intf),
@@ -267,6 +306,58 @@ static const struct {
             .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
             .bInterval = 0,
         },
+    },
+    .ss_descs = {
+        .intf = {
+            .bLength = sizeof(adb_desc.ss_descs.intf),
+            .bDescriptorType = USB_DT_INTERFACE,
+            .bInterfaceNumber = 0,
+            .bNumEndpoints = 2,
+            .bInterfaceClass = USB_CLASS_VENDOR_SPEC,
+            .bInterfaceSubClass = ADB_SUBCLASS,
+            .bInterfaceProtocol = ADB_PROTOCOL,
+            .iInterface = 1,
+        },
+        .source = {
+            .bLength = sizeof(adb_desc.ss_descs.source),
+            .bDescriptorType = USB_DT_ENDPOINT,
+            .bEndpointAddress = 1 | USB_DIR_OUT,
+            .bmAttributes = USB_ENDPOINT_XFER_BULK,
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_SS),
+        },
+        .source_comp = {
+            .bLength = sizeof(adb_desc.ss_descs.source_comp),
+            .bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
+            .bMaxBurst = 4,
+        },
+        .sink = {
+            .bLength = sizeof(adb_desc.ss_descs.sink),
+            .bDescriptorType = USB_DT_ENDPOINT,
+            .bEndpointAddress = 2 | USB_DIR_IN,
+            .bmAttributes = USB_ENDPOINT_XFER_BULK,
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_SS),
+        },
+        .sink_comp = {
+            .bLength = sizeof(adb_desc.ss_descs.sink_comp),
+            .bDescriptorType = USB_DT_SS_ENDPOINT_COMP,
+            .bMaxBurst = 4,
+        },
+    },
+    .os_header = {
+        .interface = 1,
+        .dwLength = bfdev_cpu_to_le32(sizeof(adb_desc.os_header) +
+            sizeof(adb_desc.os_desc)),
+        .bcdVersion = bfdev_cpu_to_le16(1),
+        .wIndex = bfdev_cpu_to_le16(4),
+        .bCount = 1,
+        .Reserved = 0,
+    },
+    .os_desc = {
+        .bFirstInterfaceNumber = 0,
+        .Reserved1 = 1,
+        .CompatibleID = {0},
+        .SubCompatibleID = {0},
+        .Reserved2 = {0},
     },
 };
 
@@ -2408,14 +2499,14 @@ sdbd(void)
         goto error;
     }
 
+    sctx.version = ADB_VERSION;
+    sctx.max_payload = MAX_PAYLOAD;
+
     retval = usb_init(&sctx);
     if (retval < 0) {
         bfdev_log_err("usb initialization failed\n");
         goto error;
     }
-
-    sctx.version = ADB_VERSION;
-    sctx.max_payload = MAX_PAYLOAD;
 
     for (;;) {
         retval = bfenv_eproc_run(sctx.eproc, BFENV_TIMEOUT_MAX);
