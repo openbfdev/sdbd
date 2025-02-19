@@ -2588,19 +2588,25 @@ spawn_daemon(void)
         return -BFDEV_ENXIO;
     }
 
-    if (dup2(fd, STDIN_FILENO) < 0) {
-        fprintf(stderr, "failed to dup stdin\n");
-        return -BFDEV_ENXIO;
+	if (isatty(STDIN_FILENO)) {
+        if (dup2(fd, STDIN_FILENO) < 0) {
+            fprintf(stderr, "failed to dup stdin\n");
+            return -BFDEV_ENXIO;
+        }
     }
 
-    if (dup2(fd, STDOUT_FILENO) < 0) {
-        fprintf(stderr, "failed to dup stdout\n");
-        return -BFDEV_ENXIO;
+	if (isatty(STDOUT_FILENO)) {
+        if (dup2(fd, STDOUT_FILENO) < 0) {
+            fprintf(stderr, "failed to dup stdout\n");
+            return -BFDEV_ENXIO;
+        }
     }
 
-    if (dup2(fd, STDERR_FILENO) < 0) {
-        fprintf(stderr, "failed to dup stdout\n");
-        return -BFDEV_ENXIO;
+    if (isatty(STDERR_FILENO)) {
+        if (dup2(fd, STDERR_FILENO) < 0) {
+            fprintf(stderr, "failed to dup stdout\n");
+            return -BFDEV_ENXIO;
+        }
     }
 
     return pid;
