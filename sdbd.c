@@ -105,7 +105,6 @@
 # define MAX_PAYLOAD MAX_PAYLOAD_V2
 #endif
 
-#define SYNC_FIFO_DEPTH 2
 #define SERVICE_TIMEOUT (12 * 60 * 60 * 1000)
 #define ASYNC_IOWAIT_TIME 1000
 
@@ -939,8 +938,10 @@ service_shell_close(struct sdbd_service *service)
 
     bfenv_eproc_event_remove(service->sctx->eproc, &shell->event);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
+    bfdev_free(NULL, shell->term);
     close(shell->event.fd);
 
+    bfdev_array_release(&service->stream);
     bfdev_radix_free(&service->sctx->services, service->local);
     bfdev_free(NULL, service);
 }
@@ -1236,7 +1237,7 @@ service_sync_close(struct sdbd_service *service)
 
     bfenv_eproc_event_remove(service->sctx->eproc, &sync->event);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
-    bfenv_iothread_destory(sync->fileio, iothread_release, NULL);
+    bfenv_iothread_destory(sync->fileio, NULL, NULL);
 
     bfdev_array_release(&service->stream);
     bfdev_radix_free(&service->sctx->services, service->local);
@@ -1484,9 +1485,14 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
 
     sync->fd = open(filename, O_RDONLY);
     if (sync->fd < 0) {
-        bfdev_log_err("sync recv: failed to open file '%s' error %d\n",
+        bfdev_log_warn("sync recv: failed to open file '%s' error %d\n",
             filename, errno);
-        return -BFDEV_EACCES;
+
+        retval = service_sync_fail(sync, "failed to open file");
+        if (retval < 0)
+            return retval;
+
+        return -BFDEV_ECANCELED;
     }
 
     bfdev_log_debug("sync recv: batch size %zd\n", sync->batch);
@@ -1669,14 +1675,14 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode,
     }
 
     if (sync->fd < 0) {
-        bfdev_log_err("sync send file: failed to open file '%s' error %d\n",
+        bfdev_log_warn("sync send file: failed to open file '%s' error %d\n",
             filename, errno);
 
         retval = service_sync_fail(sync, "failed to open file");
         if (retval < 0)
             return retval;
 
-        return -BFDEV_ENOERR;
+        return -BFDEV_ECANCELED;
     }
 
     bfdev_log_debug("sync send file: started '%s' mode %o\n",
@@ -1784,14 +1790,20 @@ service_sync_write_name(struct sdbd_service *service, void *data, size_t length)
 
         case SYNC_CMD_RECV: /* header + filename */
             retval = service_sync_recv(sync, sync->filename);
-            if (retval < 0)
+            if (retval < 0) {
+                if (retval == -BFDEV_ECANCELED)
+                    return -BFDEV_ENOERR;
                 return retval;
+            }
             goto finish;
 
         case SYNC_CMD_SEND: /* header + filename + data */
             retval = service_sync_send(sync, sync->filename, data, length);
-            if (retval < 0)
+            if (retval < 0) {
+                if (retval == -BFDEV_ECANCELED)
+                    return -BFDEV_ENOERR;
                 return retval;
+            }
             break;
 
         default:
@@ -1910,8 +1922,7 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     sync->service.close = service_sync_close;
     bfdev_array_init(&sync->service.stream, NULL, sizeof(uint8_t));
 
-    sync->fileio = bfenv_iothread_create(NULL, SYNC_FIFO_DEPTH,
-        BFENV_IOTHREAD_SIGREAD);
+    sync->fileio = bfenv_iothread_create(NULL, 1, BFENV_IOTHREAD_SIGREAD);
     if (!sync->fileio) {
         bfdev_log_err("sync open: failed to create iothread\n");
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
@@ -2545,7 +2556,7 @@ finish:
     usb_close(&sctx);
     bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_out);
     bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_in);
-    bfenv_iothread_destory(sctx.usbio_out, iothread_release, NULL);
+    bfenv_iothread_destory(sctx.usbio_out, NULL, NULL);
     bfenv_iothread_destory(sctx.usbio_in, iothread_release, NULL);
     bfenv_eproc_destory(sctx.eproc);
     bfdev_log_debug("finish exit\n");
