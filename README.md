@@ -5,7 +5,6 @@
 ## Design goal
 
 - Single file implementation, lightweight.
-
 - Event driven, fully ASYNC framework, high-performance.
 
 ## Features
