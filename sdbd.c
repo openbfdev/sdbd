@@ -60,8 +60,12 @@
 #define SYNC_MAXNAME BFDEV_SZ_1KiB
 #define SYNC_MAXDATA BFDEV_SZ_64KiB
 
+#define RSANUMBYTES 256
+#define RSANUMU32S (RSANUMBYTES / sizeof(uint32_t))
+
 /* ADB Command */
 #define PCMD_CNXN 0x4e584e43
+#define PCMD_AUTH 0x48545541
 #define PCMD_OPEN 0x4e45504f
 #define PCMD_OKAY 0x59414b4f
 #define PCMD_CLSE 0x45534c43
@@ -78,6 +82,11 @@
 #define SYNC_CMD_OKAY 0x59414b4f
 #define SYNC_CMD_FAIL 0x4c494146
 #define SYNC_CMD_QUIT 0x54495551
+
+#define AUTH_TOKEN 1
+#define AUTH_SIGNATURE 2
+#define AUTH_RSAPUBLICKEY 3
+#define TOKEN_SIZE BFDEV_SHA1_DIGEST_SIZE
 
 #define SHELL_FUTURE_V2 "v2"
 #define SHELL_FUTURE_PTY "pty"
@@ -107,10 +116,14 @@
 
 #define SERVICE_TIMEOUT (12 * 60 * 60 * 1000)
 #define ASYNC_IOWAIT_TIME 1000
+#define AUTH_FAIL_DELAY 500
 
 static bool sdbd_daemon;
+static bool sdbd_auth;
 static const char *sdbd_shell;
+static const char *sdbd_auth_file;
 static unsigned long sdbd_timeout = SERVICE_TIMEOUT;
+static BFDEV_LIST_HEAD(sdbd_auth_keys);
 
 static const char *
 cnxn_props[] = {
@@ -127,6 +140,20 @@ cnxn_values[] = {
     "GNU",
     "shell_v2,cmd",
 };
+
+static const char * const
+auth_key_paths[] = {
+    "/adb_keys",
+    "/data/misc/adb/adb_keys",
+};
+
+struct rsa_publickey {
+    bfdev_le32 len;
+    bfdev_le32 n0inv;
+    bfdev_le32 n[RSANUMU32S];
+    bfdev_le32 rr[RSANUMU32S];
+    bfdev_le32 exponent;
+} __bfdev_packed;
 
 struct adb_message {
     bfdev_le32 command;
@@ -432,6 +459,10 @@ struct sdbd_ctx {
     bfenv_iothread_t *usbio_in;
     bfenv_iothread_t *usbio_out;
 
+    bfdev_prandom_t rand;
+    uint8_t token[TOKEN_SIZE];
+    bool verified;
+
     uint32_t version;
     uint32_t max_payload;
 
@@ -452,8 +483,54 @@ struct sdbd_ctx {
     uint32_t check;
 };
 
+struct sdbd_rsa_publickey {
+    bfdev_list_head_t list;
+    uint32_t n[RSANUMU32S];
+    uint32_t rr[RSANUMU32S];
+    uint32_t len;
+    uint32_t n0inv;
+    uint32_t exponent;
+};
+
+static const uint8_t
+kexpectedpad_sha_rsa2048[BFDEV_SHA1_DIGEST_SIZE] = {
+    0xdc, 0xbd, 0xbe, 0x42, 0xd5, 0xf5, 0xa7, 0x2e,
+    0x6e, 0xfc, 0xf5, 0x5d, 0xaf, 0x9d, 0xea, 0x68,
+    0x7c, 0xfb, 0xf1, 0x67,
+};
+
+static const uint8_t
+kexpectedpad_sha256_rsa2048[BFDEV_SHA256_DIGEST_SIZE] = {
+    0xab, 0x28, 0x8d, 0x8a, 0xd7, 0xd9, 0x59, 0x92,
+    0xba, 0xcc, 0xf8, 0x67, 0x20, 0xe1, 0x15, 0x2e,
+    0x39, 0x8d, 0x80, 0x36, 0xd6, 0x6f, 0xf0, 0xfd,
+    0x90, 0xe8, 0x7d, 0x8b, 0xe1, 0x7c, 0x87, 0x59,
+};
+
 static int
 service_sync_write(struct sdbd_service *service, void *data, size_t length);
+
+static ssize_t
+path_read(const char *path, char *buff, size_t size)
+{
+    ssize_t length;
+    int fd;
+
+    fd = open(path, O_RDONLY);
+    if (fd < 0) {
+        bfdev_log_err("path read: failed to open file");
+        return -BFDEV_EACCES;
+    }
+
+    length = read(fd, buff, size);
+    if (length <= 0) {
+        bfdev_log_err("path read: failed to open file");
+        return -BFDEV_EFAULT;
+    }
+
+    close(fd);
+    return length;
+}
 
 static int
 sdbd_read(int fd, void *data, size_t size)
@@ -683,6 +760,189 @@ payload_cksum(uint8_t *payload, size_t length)
 
 #endif
 
+static void
+key_subm(struct sdbd_rsa_publickey *key, uint32_t *var)
+{
+    unsigned int index;
+    int64_t value;
+
+    value = 0;
+    for (index = 0; index < key->len; ++index) {
+        value += (uint64_t)var[index] - key->n[index];
+        var[index] = (uint32_t)value;
+        value >>= 32;
+    }
+}
+
+static int
+key_gem(struct sdbd_rsa_publickey *key, uint32_t *var)
+{
+    unsigned int index;
+
+    index = key->len;
+    while (index--) {
+        if (var[index] < key->n[index])
+            return 0;
+        if (var[index] > key->n[index])
+            return 1;
+    }
+
+    return 1;
+}
+
+static void
+mont_madd(struct sdbd_rsa_publickey *key,
+          uint32_t *vc, uint32_t va, uint32_t *vb)
+{
+    unsigned int index;
+    uint64_t keya, keyb;
+    uint32_t data;
+
+    keya = (uint64_t)va * vb[0] + vc[0];
+    data = (uint32_t)keya * key->n0inv;
+    keyb = (uint64_t)data * key->n[0] + (uint32_t)keya;
+
+    for (index = 1; index < key->len; ++index) {
+        keya = (keya >> 32) + (uint64_t)va * vb[index] + vc[index];
+        keyb = (keyb >> 32) + (uint64_t)data * key->n[index] + (uint32_t)keya;
+        vc[index - 1] = (uint32_t)keyb;
+    }
+
+    keya = (keya >> 32) + (keyb >> 32);
+    vc[index - 1] = (uint32_t)keya;
+
+    if (keya >> 32)
+        key_subm(key, vc);
+}
+
+static void
+mont_mul(struct sdbd_rsa_publickey *key,
+         uint32_t *vc, uint32_t *va, uint32_t *vb)
+{
+    unsigned int index;
+
+    memset(vc, 0, sizeof(*vc) * key->len);
+    for (index = 0; index < key->len; ++index)
+        mont_madd(key, vc, va[index], vb);
+}
+
+static void
+mont_modpow(struct sdbd_rsa_publickey *key, uint8_t *inout)
+{
+    uint32_t buf1[RSANUMU32S], buf2[RSANUMU32S], buf3[RSANUMU32S];
+    uint32_t *result, value;
+    unsigned int index;
+
+    for (index = 0; index < key->len; ++index) {
+        value =
+            ((uint32_t)inout[(key->len - 1 - index) * 4 + 0] << 24) |
+            ((uint32_t)inout[(key->len - 1 - index) * 4 + 1] << 16) |
+            ((uint32_t)inout[(key->len - 1 - index) * 4 + 2] << 8) |
+            ((uint32_t)inout[(key->len - 1 - index) * 4 + 3] << 0);
+        buf1[index] = value;
+    }
+
+    if (key->exponent == 65537) {
+        result = buf3;
+        mont_mul(key, buf2, buf1, key->rr);
+        for (index = 0; index < 16; index += 2) {
+            mont_mul(key, buf3, buf2, buf2);
+            mont_mul(key, buf2, buf3, buf3);
+        }
+        mont_mul(key, result, buf2, buf1);
+    } else if (key->exponent == 3) {
+        result = buf2;
+        mont_mul(key, buf2, buf1, key->rr);
+        mont_mul(key, buf3, buf2, buf2);
+        mont_mul(key, result, buf3, buf1);
+    }
+
+    if (key_gem(key, result))
+        key_subm(key, result);
+
+    for (index = 0; index < key->len; ++index) {
+        value = result[key->len - 1 - index];
+        inout[index * 4 + 0] = value >> 24;
+        inout[index * 4 + 1] = value >> 16;
+        inout[index * 4 + 2] = value >> 8;
+        inout[index * 4 + 3] = value >> 0;
+    }
+}
+
+static int
+rsa_verify(struct sdbd_rsa_publickey *key, void *sig,
+           uint8_t *hash, size_t hashlen)
+{
+    uint8_t buff[RSANUMBYTES];
+    const uint8_t *padding_hash;
+    unsigned int count;
+
+    BFDEV_BUG_ON(key->len != RSANUMU32S);
+    BFDEV_BUG_ON(key->exponent != 3 && key->exponent != 65537);
+
+    if (hashlen != BFDEV_SHA1_DIGEST_SIZE &&
+        hashlen != BFDEV_SHA256_DIGEST_SIZE) {
+        bfdev_log_err("rsa verify: unsupported hash\n");
+        return false;
+    }
+
+    memcpy(buff, sig, RSANUMBYTES);
+    mont_modpow(key, (void *)buff);
+
+    for (count = RSANUMBYTES - hashlen; count < RSANUMBYTES; ++count)
+        buff[count] ^= *hash++;
+
+    switch (hashlen) {
+        case BFDEV_SHA1_DIGEST_SIZE: {
+            bfdev_sha1_ctx_t sha1;
+            padding_hash = kexpectedpad_sha_rsa2048;
+            bfdev_sha1_init(&sha1);
+            bfdev_sha1_update(&sha1, buff, RSANUMBYTES);
+            bfdev_sha1_finish(&sha1, buff);
+            break;
+        }
+
+        case BFDEV_SHA256_DIGEST_SIZE: {
+            bfdev_sha2_ctx_t sha2;
+            padding_hash = kexpectedpad_sha256_rsa2048;
+            bfdev_sha256_init(&sha2);
+            bfdev_sha2_update(&sha2, buff, RSANUMBYTES);
+            bfdev_sha256_finish(&sha2, buff);
+            break;
+        }
+
+        default:
+            BFDEV_BUG();
+    }
+
+    if (memcmp(padding_hash, buff, hashlen)) {
+        bfdev_log_notice("rsa verify: hash verify failed\n");
+        return false;
+    }
+
+    return true;
+}
+
+static int
+auth_verify(struct sdbd_ctx *sctx, void *sig, int siglen)
+{
+    struct sdbd_rsa_publickey *key;
+    int retval;
+
+    if (siglen != RSANUMBYTES) {
+        bfdev_log_notice("auth verify: invalid input length\n");
+        return false;
+    }
+
+    bfdev_list_for_each_entry(key, &sdbd_auth_keys, list) {
+        retval = rsa_verify(key, sig, sctx->token, TOKEN_SIZE);
+        if (retval < 0 || retval == true)
+            return retval;
+    }
+
+    return false;
+}
+
 static int
 send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
 {
@@ -696,53 +956,6 @@ send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
     packet->magic = magic;
 
     return write_packet(sctx, packet, payload);
-}
-
-static size_t
-make_connect_data(char *buff, size_t bsize)
-{
-    size_t remaining, len;
-    unsigned int count;
-
-    remaining = bsize;
-    len = bfdev_scnprintf(buff, remaining, "%s::", ADB_DEVICE_BANNER);
-    remaining -= len;
-    buff += len;
-
-    for(count = 0; count < BFDEV_ARRAY_SIZE(cnxn_props); ++count) {
-        len = bfdev_scnprintf(buff, remaining, "%s=%s;",
-            cnxn_props[count], cnxn_values[count]);
-        remaining -= len;
-        buff += len;
-    }
-
-    return bsize - remaining + 1;
-}
-
-static int
-send_connect(struct sdbd_ctx *sctx)
-{
-    uint8_t payload[MAX_PAYLOAD];
-    struct sdbd_packet packet;
-    size_t length;
-    int retval;
-
-    packet.command = PCMD_CNXN;
-    packet.args[0] = sctx->version;
-    packet.args[1] = sctx->max_payload;
-
-    length = make_connect_data((char *)payload, sizeof(payload));
-    if (length > MAX_PAYLOAD_V1)
-        bfdev_log_warn("send connect: banner too large\n");
-
-    bfdev_log_info("send connect: '%s'\n", payload);
-    packet.length = length;
-
-    retval = send_packet(sctx, &packet, payload);
-    if (retval < 0)
-        return retval;
-
-    return -BFDEV_ENOERR;
 }
 
 static int
@@ -857,6 +1070,77 @@ stream_accumulate(struct sdbd_service *service, size_t request,
         return -BFDEV_EAGAIN;
 
     return avail;
+}
+
+static size_t
+make_connect_data(char *buff, size_t bsize)
+{
+    size_t remaining, len;
+    unsigned int count;
+
+    remaining = bsize;
+    len = bfdev_scnprintf(buff, remaining, "%s::", ADB_DEVICE_BANNER);
+    remaining -= len;
+    buff += len;
+
+    for(count = 0; count < BFDEV_ARRAY_SIZE(cnxn_props); ++count) {
+        len = bfdev_scnprintf(buff, remaining, "%s=%s;",
+            cnxn_props[count], cnxn_values[count]);
+        remaining -= len;
+        buff += len;
+    }
+
+    return bsize - remaining + 1;
+}
+
+static int
+send_connect(struct sdbd_ctx *sctx)
+{
+    uint8_t payload[MAX_PAYLOAD];
+    struct sdbd_packet packet;
+    size_t length;
+    int retval;
+
+    packet.command = PCMD_CNXN;
+    packet.args[0] = sctx->version;
+    packet.args[1] = sctx->max_payload;
+
+    length = make_connect_data((char *)payload, sizeof(payload));
+    if (length > MAX_PAYLOAD_V1)
+        bfdev_log_warn("send connect: banner too large\n");
+
+    bfdev_log_info("send connect: '%s'\n", payload);
+    packet.length = length;
+
+    retval = send_packet(sctx, &packet, payload);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+send_auth_request(struct sdbd_ctx *sctx)
+{
+    struct sdbd_packet packet;
+    unsigned int count;
+    int retval;
+
+    packet.command = PCMD_AUTH;
+    packet.args[0] = AUTH_TOKEN;
+    packet.args[1] = 0;
+
+    for (count = 0; count < TOKEN_SIZE; ++count)
+        sctx->token[count] = bfdev_prandom_value(&sctx->rand);
+
+    bfdev_log_info("send auth request\n");
+    packet.length = TOKEN_SIZE;
+
+    retval = send_packet(sctx, &packet, sctx->token);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
 }
 
 static void
@@ -1314,7 +1598,7 @@ service_sync_list(struct sdbd_sync_service *sync, char *filename)
 {
     char buffer[PATH_MAX + 1], *fname;
     struct sync_directry syncmsg;
-    struct stat stat;
+    struct stat stbuf;
     size_t pathlen, filelen;
     struct dirent *dirent;
     int retval;
@@ -1337,10 +1621,10 @@ service_sync_list(struct sdbd_sync_service *sync, char *filename)
         BFDEV_BUG_ON(pathlen + filelen > PATH_MAX);
 
         strcpy(fname, dirent->d_name);
-        if (!lstat(buffer, &stat)) {
-            syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
-            syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
-            syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
+        if (!lstat(buffer, &stbuf)) {
+            syncmsg.mode = bfdev_cpu_to_le32(stbuf.st_mode);
+            syncmsg.size = bfdev_cpu_to_le32(stbuf.st_size);
+            syncmsg.time = bfdev_cpu_to_le32(stbuf.st_mtime);
             syncmsg.namelen = bfdev_cpu_to_le32(filelen);
 
             retval = send_data(sync->service.sctx, sync->service.local,
@@ -1576,8 +1860,7 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
                 bfdev_log_debug("sync send file write: wait header\n");
                 return -BFDEV_ENOERR;
             }
-
-            bfdev_log_debug("sync send file write: wait failed\n");
+            bfdev_log_err("sync send file write: wait failed\n");
             retval = retlen;
             goto failed;
         }
@@ -1760,7 +2043,7 @@ service_sync_write_name(struct sdbd_service *service, void *data, size_t length)
             bfdev_log_debug("sync write: wait header\n");
             return -BFDEV_ENOERR;
         }
-        bfdev_log_debug("sync write: wait failed\n");
+        bfdev_log_err("sync write: wait failed\n");
         return retlen;
     }
 
@@ -2113,6 +2396,73 @@ parse_connect(struct sdbd_ctx *sctx, uint8_t *payload)
 }
 
 static int
+adb_connect(struct sdbd_ctx *sctx, uint8_t *payload)
+{
+    int retval;
+
+    bfdev_log_notice("adb connected\n");
+    retval = parse_connect(sctx, payload);
+    if (retval < 0)
+        return retval;
+
+    if (sdbd_auth)
+        retval = send_auth_request(sctx);
+    else {
+        sctx->verified = true;
+        retval = send_connect(sctx);
+    }
+
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+adb_auth(struct sdbd_ctx *sctx, uint8_t *payload)
+{
+    int retval;
+
+    switch (sctx->args[0]) {
+        case AUTH_TOKEN:
+            bfdev_log_debug("handle auth: auth token\n");
+            /* Do nothing */
+            break;
+
+        case AUTH_RSAPUBLICKEY:
+            bfdev_log_debug("handle auth: auth rsapublickey\n");
+            /* Do nothing */
+            break;
+
+        case AUTH_SIGNATURE:
+            bfdev_log_debug("handle auth: auth signature\n");
+            retval = auth_verify(sctx, payload, sctx->length);
+            if (retval < 0)
+                return retval;
+
+            if (retval == false) {
+                bfdev_log_debug("handle auth: auth failed\n");
+                usleep(AUTH_FAIL_DELAY * 1000);
+                retval = send_auth_request(sctx);
+            } else {
+                bfdev_log_debug("handle auth: auth succeed\n");
+                sctx->verified = true;
+                retval = send_connect(sctx);
+            }
+
+            if (retval < 0)
+                return retval;
+            break;
+
+        default:
+            bfdev_log_warn("handle auth: unknow\n");
+            break;
+    }
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 {
     int retval;
@@ -2124,15 +2474,15 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 
     switch (cmd) {
         case PCMD_CNXN:
-            retval = parse_connect(sctx, payload);
+            retval = adb_connect(sctx, payload);
             if (retval < 0)
                 return retval;
+            break;
 
-            retval = send_connect(sctx);
+        case PCMD_AUTH:
+            retval = adb_auth(sctx, payload);
             if (retval < 0)
                 return retval;
-
-            bfdev_log_notice("usb connected\n");
             break;
 
         case PCMD_OPEN:
@@ -2167,7 +2517,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 }
 
 static int
-adb_usb_recv_handle(struct sdbd_ctx *sctx)
+sdbd_usb_recv_handle(struct sdbd_ctx *sctx)
 {
     uint8_t payload[MAX_PAYLOAD + 1];
     int retval;
@@ -2246,7 +2596,7 @@ sdbd_usb_out_handle(bfenv_eproc_event_t *event, void *pdata)
 
     switch (request.event) {
         case BFENV_IOTHREAD_EVENT_READ:
-            retval = adb_usb_recv_handle(sctx);
+            retval = sdbd_usb_recv_handle(sctx);
             if (retval < 0)
                 return retval;
             break;
@@ -2459,9 +2809,115 @@ sdbd_exception(int error)
 }
 
 static int
+read_keys(const char *path)
+{
+    char line[4096], *sep;
+    FILE *file;
+    unsigned int count;
+    int retval;
+
+    file = fopen(path, "r");
+    if (!file) {
+        bfdev_log_err("read keys: failed to open file\n");
+        return -BFDEV_EACCES;
+    }
+
+    while (fgets(line, sizeof(line), file)) {
+        struct sdbd_rsa_publickey *key;
+        struct rsa_publickey *rawkey;
+        uint8_t buff[600];
+        size_t size;
+
+        sep = strpbrk(line, " \t");
+        if (sep)
+            *sep = '\0';
+
+        size = bfdev_base64_decode_length(sep - line);
+        bfdev_log_debug("read keys: size %zu\n", size);
+
+        if (size != sizeof(*rawkey) + 1) {
+            bfdev_log_warn("read keys: invalid base64 length\n");
+            continue;
+        }
+
+        retval = bfdev_base64_decode((void *)buff, line, sep - line);
+        if (retval < 0) {
+            bfdev_log_warn("read keys: invalid base64 data\n");
+            continue;
+        }
+
+        rawkey = (void *)buff;
+        if (bfdev_le32_to_cpu(rawkey->len) != RSANUMU32S) {
+            bfdev_log_warn("read keys: invalid key length\n");
+            continue;
+        }
+
+        if (bfdev_le32_to_cpu(rawkey->exponent) != 3 &&
+            bfdev_le32_to_cpu(rawkey->exponent) != 65537) {
+            bfdev_log_notice("read keys: unsupported exponent\n");
+            continue;
+        }
+
+        key = bfdev_malloc(NULL, sizeof(*key));
+        if (!key)
+            return -BFDEV_ENOMEM;
+
+        key->len = bfdev_le32_to_cpu(rawkey->len);
+        key->n0inv = bfdev_le32_to_cpu(rawkey->n0inv);
+        key->exponent = bfdev_le32_to_cpu(rawkey->exponent);
+        bfdev_list_add(&sdbd_auth_keys, &key->list);
+
+        for (count = 0; count < RSANUMU32S; ++count) {
+            key->n[count] = bfdev_le32_to_cpu(rawkey->n[count]);
+            key->rr[count] = bfdev_le32_to_cpu(rawkey->rr[count]);
+        }
+    }
+
+    fclose(file);
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+load_keys(void)
+{
+    unsigned int count;
+    struct stat stbuf;
+    int retval;
+
+    if (sdbd_auth_file) {
+        retval = read_keys(sdbd_auth_file);
+        if (retval < 0)
+            return retval;
+        goto finish;
+    }
+
+    for (count = 0; count < BFDEV_ARRAY_SIZE(auth_key_paths); ++count) {
+        const char *path;
+
+        path = auth_key_paths[count];
+        bfdev_log_debug("load keys: file '%s'\n", path);
+
+        if (stat(path, &stbuf)) {
+            bfdev_log_debug("load keys: not found\n");
+            continue;
+        }
+
+        retval = read_keys(path);
+        if (retval < 0)
+            return retval;
+    }
+
+finish:
+    sdbd_auth = !bfdev_list_check_empty(&sdbd_auth_keys);
+    return -BFDEV_ENOERR;
+}
+
+static int
 sdbd(void)
 {
     struct sdbd_ctx sctx;
+    uint64_t seed;
     int retval;
 
     bzero(&sctx, sizeof(sctx));
@@ -2472,6 +2928,21 @@ sdbd(void)
         bfdev_log_err("eproc create failed\n");
         goto error;
     }
+
+    retval = load_keys();
+    if (retval < 0) {
+        bfdev_log_err("failed to load auth keys\n");
+        goto error;
+    }
+
+    retval = path_read("/dev/random", (void *)&seed, sizeof(seed));
+    if (retval != sizeof(seed)) {
+        bfdev_log_err("failed to read seed\n");
+        goto error;
+    }
+
+    bfdev_prandom_init(&sctx.rand);
+    bfdev_prandom_seed(&sctx.rand, seed);
 
     retval = signal_init(&sctx);
     if (retval < 0) {
@@ -2635,6 +3106,7 @@ usage(const char *path)
     fprintf(stderr, "  -h, --help            Display this information.\n");
     fprintf(stderr, "  -v, --version         Display version information.\n");
     fprintf(stderr, "  -d, --daemon          Run in daemon mode.\n");
+    fprintf(stderr, "  -a, --authfile=PATH   Selects a public key file.\n");
     fprintf(stderr, "  -f, --logfile=PATH    Redirect logs to file.\n");
     fprintf(stderr, "  -l, --loglevel=LEVEL  Set print log level threshold.\n");
     fprintf(stderr, "  -t, --timout=SECONDS  Set service idle timeout value.\n");
@@ -2668,6 +3140,7 @@ options[] = {
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'v'},
     {"daemon", no_argument, NULL, 'd'},
+    {"authfile", required_argument, NULL, 'a'},
     {"logfile", required_argument, NULL, 'f'},
     {"loglevel", required_argument, NULL, 'l'},
     {"timeout", required_argument, NULL, 't'},
@@ -2686,13 +3159,17 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdf:l:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvda:f:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
         switch (arg) {
             case 'd':
                 sdbd_daemon = true;
+                break;
+
+            case 'a':
+                sdbd_auth_file = optarg;
                 break;
 
             case 'f':
