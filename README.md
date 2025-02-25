@@ -11,6 +11,7 @@
 
 - [x] Daemon mode
 - [x] USB 3.2 SuperSpeed+ support
+- [x] RSA-2048 Authentication
 - [x] Version 2 transmission protocol
 - [x] Shell version 2, can change windows size
 - [x] Automatic timeout close for unresponsive services
@@ -61,6 +62,7 @@ Options:
   -h, --help            Display this information.
   -v, --version         Display version information.
   -d, --daemon          Run in daemon mode.
+  -a, --authfile=PATH   Selects a public key file.
   -f, --logfile=PATH    Redirect logs to file.
   -l, --loglevel=LEVEL  Set print log level threshold.
   -t, --timout=SECONDS  Set service idle timeout value.
