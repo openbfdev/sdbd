@@ -1872,7 +1872,7 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
         size = bfdev_le32_to_cpu(syncmsg->size);
         bfdev_array_reset(&sync->service.stream);
 
-        bfdev_log_debug("sync send file write: cmd %c%c%c%c size %u\n",
+        bfdev_log_debug("sync send file write: cmd '%c%c%c%c' size %u\n",
             (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
             (cmd >> 24) & 0xff, size);
 
@@ -2134,7 +2134,7 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
     data += retlen;
     length -= retlen;
 
-    bfdev_log_notice("sync write: command %c%c%c%c namelen %u\n",
+    bfdev_log_notice("sync write: command '%c%c%c%c' namelen %u\n",
         (sync->cmd >> 0) & 0xff, (sync->cmd >> 8) & 0xff,
         (sync->cmd >> 16) & 0xff, (sync->cmd >> 24) & 0xff, sync->namelen);
 
@@ -2262,6 +2262,24 @@ service_timemout(bfenv_eproc_timer_t *timer, void *pdata)
 }
 
 static int
+service_kick(struct sdbd_service *service)
+{
+    struct sdbd_ctx *sctx;
+    int retval;
+
+    sctx = service->sctx;
+    bfdev_log_debug("service kick: local %u remote %u\n",
+        service->local, service->remote);
+
+    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
+    retval = bfenv_eproc_timer_add(sctx->eproc, &service->timer, sdbd_timeout);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
 service_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
@@ -2315,16 +2333,14 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
     local = sctx->args[1];
     psrv = bfdev_radix_find(&sctx->services, local);
     if (!psrv) {
-        bfdev_log_err("service write: failed connect to %d\n", local);
+        bfdev_log_notice("service write: failed connect to %d\n", local);
         return -BFDEV_ENOERR;
     }
 
     service = *psrv;
     remote = service->remote;
 
-    bfenv_eproc_timer_remove(sctx->eproc, &service->timer);
-    retval = bfenv_eproc_timer_add(sctx->eproc, &service->timer,
-        sdbd_timeout);
+    retval = service_kick(service);
     if (retval < 0)
         return retval;
 
@@ -2334,6 +2350,28 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
         return retval;
 
     retval = send_okay(sctx, local, remote);
+    if (retval < 0)
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_okay(struct sdbd_ctx *sctx)
+{
+    struct sdbd_service *service, **psrv;
+    uint32_t local;
+    int retval;
+
+    local = sctx->args[1];
+    psrv = bfdev_radix_find(&sctx->services, local);
+    if (!psrv) {
+        bfdev_log_notice("service okay: failed connect to %d\n", local);
+        return -BFDEV_ENOERR;
+    }
+
+    service = *psrv;
+    retval = service_kick(service);
     if (retval < 0)
         return retval;
 
@@ -2467,7 +2505,7 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
 {
     int retval;
 
-    bfdev_log_info("handled packet: %c%c%c%c (%u %u) length %u\n",
+    bfdev_log_info("handled packet: '%c%c%c%c' (%u %u) length %u\n",
         (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
         (cmd >> 24) & 0xff, sctx->args[0], sctx->args[1], sctx->length);
     bfdev_log_debug("packet payload: '%s'\n", payload);
@@ -2508,7 +2546,11 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
             break;
 
         case PCMD_OKAY:
-            /* Ignore */
+            if (!sctx->verified)
+                break;
+            retval = service_okay(sctx);
+            if (retval < 0)
+                return retval;
             break;
 
         default:
