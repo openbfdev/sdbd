@@ -2486,16 +2486,22 @@ handle_packet(struct sdbd_ctx *sctx, uint32_t cmd, uint8_t *payload)
             break;
 
         case PCMD_OPEN:
+            if (!sctx->verified)
+                break;
             retval = service_open(sctx, (void *)payload);
             if (retval < 0)
                 return retval;
             break;
 
         case PCMD_CLSE:
+            if (!sctx->verified)
+                break;
             service_close(sctx);
             break;
 
         case PCMD_WRTE:
+            if (!sctx->verified)
+                break;
             retval = service_write(sctx, payload);
             if (retval < 0)
                 return retval;
@@ -2731,7 +2737,7 @@ usb_init(struct sdbd_ctx *sctx)
         return -BFDEV_EACCES;
     }
 
-    bfdev_log_debug("usbio read: message\n");
+    bfdev_log_debug("usb init: read message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
         &sctx->msgbuff, sizeof(sctx->msgbuff));
     if (retval < 0)
@@ -3006,6 +3012,7 @@ sdbd(void)
         switch (retval) {
             case -BFDEV_ESHUTDOWN:
                 bfdev_log_notice("usb disconnected\n");
+                sctx.verified = false;
                 service_close_all(&sctx);
                 retval = usb_kick(&sctx);
                 if (retval < 0)
