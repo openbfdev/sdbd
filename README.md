@@ -54,7 +54,7 @@ Usage:
 
 ```shell
 $ sdbd --help
-Usage: ./sdbd [option] ...
+Usage: ./sdbd-reldbg [option] ...
 Simple Debug Bridge Daemon (SDBD) v0.3
 Hardware Acceleration: 'Arm Neon'
 
@@ -62,6 +62,7 @@ Options:
   -h, --help            Display this information.
   -v, --version         Display version information.
   -d, --daemon          Run in daemon mode.
+  -n, --noauth          Do not use authentication.
   -a, --authfile=PATH   Selects a public key file.
   -f, --logfile=PATH    Redirect logs to file.
   -l, --loglevel=LEVEL  Set print log level threshold.
@@ -76,6 +77,10 @@ The following optionals are for loglevel:
   5: Notice   (Normal but significant condition)
   6: Info     (Informational)
   7: Debug    (Debug-level messages)
+
+By default, SDBD retrieves the auth key from the path specified below:
+  '/adb_keys'
+  '/data/misc/adb/adb_keys'
 
 For bug reporting, please visit:
 <https://github.com/openbfdev/sdbd>
