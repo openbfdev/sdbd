@@ -121,6 +121,8 @@
 static bool sdbd_daemon;
 static bool sdbd_auth;
 static bool sdbd_noauth;
+static bool sdbd_noaccel;
+
 static const char *sdbd_shell;
 static const char *sdbd_auth_file;
 static unsigned long sdbd_timeout = SERVICE_TIMEOUT;
@@ -677,8 +679,9 @@ write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
 static const char
 hardware_accel[] = "Arm Neon";
 
+#define payload_cksum_accel payload_cksum_accel
 static uint32_t
-payload_cksum(uint8_t *payload, size_t length)
+payload_cksum_accel(uint8_t *payload, size_t length)
 {
     uint32_t cksum;
 
@@ -713,8 +716,9 @@ payload_cksum(uint8_t *payload, size_t length)
 static const char
 hardware_accel[] = "Intel SSE2";
 
+#define payload_cksum_accel payload_cksum_accel
 static uint32_t
-payload_cksum(uint8_t *payload, size_t length)
+payload_cksum_accel(uint8_t *payload, size_t length)
 {
     uint32_t cksum;
     __m128i sum;
@@ -747,10 +751,17 @@ payload_cksum(uint8_t *payload, size_t length)
 static const char
 hardware_accel[] = "None";
 
+#endif
+
 static uint32_t
 payload_cksum(uint8_t *payload, size_t length)
 {
     uint32_t cksum;
+
+#ifdef payload_cksum_accel
+    if (!sdbd_noaccel)
+        return payload_cksum_accel(payload, length);
+#endif
 
     cksum = 0;
     while (length-- > 0)
@@ -759,7 +770,6 @@ payload_cksum(uint8_t *payload, size_t length)
     return cksum;
 }
 
-#endif
 
 static void
 key_subm(struct sdbd_rsa_publickey *key, uint32_t *var)
@@ -3160,6 +3170,7 @@ usage(const char *path)
     fprintf(stderr, "  -h, --help            Display this information.\n");
     fprintf(stderr, "  -v, --version         Display version information.\n");
     fprintf(stderr, "  -d, --daemon          Run in daemon mode.\n");
+    fprintf(stderr, "  -x, --noaccel         Do not use hw acceleration.\n");
     fprintf(stderr, "  -n, --noauth          Do not use authentication.\n");
     fprintf(stderr, "  -a, --authfile=PATH   Selects a public key file.\n");
     fprintf(stderr, "  -f, --logfile=PATH    Redirect logs to file.\n");
@@ -3200,6 +3211,7 @@ options[] = {
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'v'},
     {"daemon", no_argument, NULL, 'd'},
+    {"noaccel", no_argument, NULL, 'x'},
     {"noauth", no_argument, NULL, 'n'},
     {"authfile", required_argument, NULL, 'a'},
     {"logfile", required_argument, NULL, 'f'},
@@ -3220,13 +3232,17 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdna:f:l:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdxna:f:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
         switch (arg) {
             case 'd':
                 sdbd_daemon = true;
+                break;
+
+            case 'x':
+                sdbd_noaccel = true;
                 break;
 
             case 'n':
