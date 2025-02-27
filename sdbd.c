@@ -120,6 +120,7 @@
 
 static bool sdbd_daemon;
 static bool sdbd_auth;
+static bool sdbd_noauth;
 static const char *sdbd_shell;
 static const char *sdbd_auth_file;
 static unsigned long sdbd_timeout = SERVICE_TIMEOUT;
@@ -2866,8 +2867,8 @@ read_keys(const char *path)
 
     file = fopen(path, "r");
     if (!file) {
-        bfdev_log_err("read keys: failed to open file\n");
-        return -BFDEV_EACCES;
+        bfdev_log_warn("read keys: failed to open file\n");
+        return -BFDEV_ENOERR;
     }
 
     while (fgets(line, sizeof(line), file)) {
@@ -2977,10 +2978,12 @@ sdbd(void)
         goto error;
     }
 
-    retval = load_keys();
-    if (retval < 0) {
-        bfdev_log_err("failed to load auth keys\n");
-        goto error;
+    if (!sdbd_noauth) {
+        retval = load_keys();
+        if (retval < 0) {
+            bfdev_log_err("failed to load auth keys\n");
+            goto error;
+        }
     }
 
     retval = path_read("/dev/random", (void *)&seed, sizeof(seed));
@@ -3146,6 +3149,8 @@ spawn_daemon(void)
 static __bfdev_noreturn void
 usage(const char *path)
 {
+    unsigned int count;
+
     fprintf(stderr, "Usage: %s [option] ...\n", path);
     fprintf(stderr, "Simple Debug Bridge Daemon (SDBD) " SDBD_VERSION "\n");
     fprintf(stderr, "Hardware Acceleration: '%s'\n", hardware_accel);
@@ -3155,10 +3160,11 @@ usage(const char *path)
     fprintf(stderr, "  -h, --help            Display this information.\n");
     fprintf(stderr, "  -v, --version         Display version information.\n");
     fprintf(stderr, "  -d, --daemon          Run in daemon mode.\n");
+    fprintf(stderr, "  -n, --noauth          Do not use authentication.\n");
     fprintf(stderr, "  -a, --authfile=PATH   Selects a public key file.\n");
     fprintf(stderr, "  -f, --logfile=PATH    Redirect logs to file.\n");
     fprintf(stderr, "  -l, --loglevel=LEVEL  Set print log level threshold.\n");
-    fprintf(stderr, "  -t, --timout=SECONDS  Set service idle timeout value.\n");
+    fprintf(stderr, "  -t, --timout=SECONDS  Set services idle timeout value.\n");
 
     fprintf(stderr, "\n");
     fprintf(stderr, "The following optionals are for loglevel:\n");
@@ -3170,6 +3176,11 @@ usage(const char *path)
     fprintf(stderr, "  5: Notice   (Normal but significant condition)\n");
     fprintf(stderr, "  6: Info     (Informational)\n");
     fprintf(stderr, "  7: Debug    (Debug-level messages)\n");
+
+    fprintf(stderr, "\n");
+    fprintf(stderr, "By default, SDBD retrieves the auth key from the path specified below:\n");
+    for (count = 0; count < BFDEV_ARRAY_SIZE(auth_key_paths); ++count)
+        fprintf(stderr, "  '%s'\n", auth_key_paths[count]);
 
     fprintf(stderr, "\n");
     fprintf(stderr, "For bug reporting, please visit:\n");
@@ -3189,6 +3200,7 @@ options[] = {
     {"help", no_argument, NULL, 'h'},
     {"version", no_argument, NULL, 'v'},
     {"daemon", no_argument, NULL, 'd'},
+    {"noauth", no_argument, NULL, 'n'},
     {"authfile", required_argument, NULL, 'a'},
     {"logfile", required_argument, NULL, 'f'},
     {"loglevel", required_argument, NULL, 'l'},
@@ -3208,13 +3220,17 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvda:f:l:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdna:f:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
         switch (arg) {
             case 'd':
                 sdbd_daemon = true;
+                break;
+
+            case 'n':
+                sdbd_noauth = true;
                 break;
 
             case 'a':
