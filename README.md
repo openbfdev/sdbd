@@ -64,6 +64,7 @@ Options:
   -d, --daemon          Run in daemon mode.
   -n, --noauth          Do not use authentication.
   -a, --authfile=PATH   Selects a public key file.
+  -s, --syslog          Redirect logs to syslog.
   -f, --logfile=PATH    Redirect logs to file.
   -l, --loglevel=LEVEL  Set print log level threshold.
   -t, --timout=SECONDS  Set service idle timeout value.
