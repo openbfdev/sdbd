@@ -771,7 +771,6 @@ payload_cksum(uint8_t *payload, size_t length)
     return cksum;
 }
 
-
 static void
 key_subm(struct sdbd_rsa_publickey *key, uint32_t *var)
 {
@@ -849,8 +848,8 @@ mont_modpow(struct sdbd_rsa_publickey *key, uint8_t *inout)
         value =
             ((uint32_t)inout[(key->len - 1 - index) * 4 + 0] << 24) |
             ((uint32_t)inout[(key->len - 1 - index) * 4 + 1] << 16) |
-            ((uint32_t)inout[(key->len - 1 - index) * 4 + 2] << 8) |
-            ((uint32_t)inout[(key->len - 1 - index) * 4 + 3] << 0);
+            ((uint32_t)inout[(key->len - 1 - index) * 4 + 2] <<  8) |
+            ((uint32_t)inout[(key->len - 1 - index) * 4 + 3] <<  0);
         buf1[index] = value;
     }
 
@@ -862,7 +861,7 @@ mont_modpow(struct sdbd_rsa_publickey *key, uint8_t *inout)
             mont_mul(key, buf2, buf3, buf3);
         }
         mont_mul(key, result, buf2, buf1);
-    } else if (key->exponent == 3) {
+    } else { /* key->exponent == 3 */
         result = buf2;
         mont_mul(key, buf2, buf1, key->rr);
         mont_mul(key, buf3, buf2, buf2);
@@ -3105,7 +3104,7 @@ error:
 static int
 log_redirect_syslog(bfdev_log_message_t *msg, void *pdata)
 {
-   int priority;
+    int priority;
 
     switch (msg->level) {
         case BFDEV_LEVEL_EMERG:   priority = LOG_EMERG;   break;
