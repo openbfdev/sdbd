@@ -13,6 +13,7 @@
 #include <signal.h>
 #include <fcntl.h>
 #include <pty.h>
+#include <syslog.h>
 #include <sys/wait.h>
 #include <sys/ioctl.h>
 #include <sys/eventfd.h>
@@ -3102,7 +3103,28 @@ error:
 }
 
 static int
-log_redirect(bfdev_log_message_t *msg, void *pdata)
+log_redirect_syslog(bfdev_log_message_t *msg, void *pdata)
+{
+   int priority;
+
+    switch (msg->level) {
+        case BFDEV_LEVEL_EMERG:   priority = LOG_EMERG;   break;
+        case BFDEV_LEVEL_ALERT:   priority = LOG_ALERT;   break;
+        case BFDEV_LEVEL_CRIT:    priority = LOG_CRIT;    break;
+        case BFDEV_LEVEL_ERR:     priority = LOG_ERR;     break;
+        case BFDEV_LEVEL_WARNING: priority = LOG_WARNING; break;
+        case BFDEV_LEVEL_NOTICE:  priority = LOG_NOTICE;  break;
+        case BFDEV_LEVEL_INFO:    priority = LOG_INFO;    break;
+        case BFDEV_LEVEL_DEBUG:   priority = LOG_DEBUG;   break;
+        default:                  priority = LOG_INFO;    break;
+    }
+
+    syslog(priority, "%.*s", (int)msg->length, msg->buff);
+    return msg->length;
+}
+
+static int
+log_redirect_file(bfdev_log_message_t *msg, void *pdata)
 {
     return write((int)(uintptr_t)pdata, msg->buff, msg->length);
 }
@@ -3173,6 +3195,7 @@ usage(const char *path)
     fprintf(stderr, "  -x, --noaccel         Do not use hw acceleration.\n");
     fprintf(stderr, "  -n, --noauth          Do not use authentication.\n");
     fprintf(stderr, "  -a, --authfile=PATH   Selects a public key file.\n");
+    fprintf(stderr, "  -s, --syslog          Redirect logs to syslog.\n");
     fprintf(stderr, "  -f, --logfile=PATH    Redirect logs to file.\n");
     fprintf(stderr, "  -l, --loglevel=LEVEL  Set print log level threshold.\n");
     fprintf(stderr, "  -t, --timout=SECONDS  Set services idle timeout value.\n");
@@ -3208,15 +3231,16 @@ version(void)
 
 static const struct option
 options[] = {
-    {"help", no_argument, NULL, 'h'},
-    {"version", no_argument, NULL, 'v'},
-    {"daemon", no_argument, NULL, 'd'},
-    {"noaccel", no_argument, NULL, 'x'},
-    {"noauth", no_argument, NULL, 'n'},
-    {"authfile", required_argument, NULL, 'a'},
-    {"logfile", required_argument, NULL, 'f'},
-    {"loglevel", required_argument, NULL, 'l'},
-    {"timeout", required_argument, NULL, 't'},
+    {"help",      no_argument,        NULL, 'h'},
+    {"version",   no_argument,        NULL, 'v'},
+    {"daemon",    no_argument,        NULL, 'd'},
+    {"noaccel",   no_argument,        NULL, 'x'},
+    {"noauth",    no_argument,        NULL, 'n'},
+    {"authfile",  required_argument,  NULL, 'a'},
+    {"syslog",    no_argument,        NULL, 's'},
+    {"logfile",   required_argument,  NULL, 'f'},
+    {"loglevel",  required_argument,  NULL, 'l'},
+    {"timeout",   required_argument,  NULL, 't'},
     { }, /* NULL */
 };
 
@@ -3232,7 +3256,7 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdxna:f:l:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdxna:sf:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
@@ -3253,6 +3277,12 @@ main(int argc, char *const argv[])
                 sdbd_auth_file = optarg;
                 break;
 
+            case 's':
+                openlog(MODULE_NAME, LOG_PID | LOG_CONS, LOG_DAEMON);
+                bfdev_log_default.write = log_redirect_syslog;
+                bfdev_log_color_clr(&bfdev_log_default);
+                break;
+
             case 'f':
                 logfd = open(optarg, O_CREAT | O_WRONLY | O_APPEND, 0644);
                 if (logfd < 0) {
@@ -3260,7 +3290,7 @@ main(int argc, char *const argv[])
                     usage(argv[0]);
                 }
 
-                bfdev_log_default.write = log_redirect;
+                bfdev_log_default.write = log_redirect_file;
                 bfdev_log_default.pdata = (void *)(uintptr_t)logfd;
                 bfdev_log_color_clr(&bfdev_log_default);
                 break;
