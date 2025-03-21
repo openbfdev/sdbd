@@ -296,7 +296,7 @@ static const struct {
             .bDescriptorType = USB_DT_ENDPOINT,
             .bEndpointAddress = 1 | USB_DIR_OUT,
             .bmAttributes = USB_ENDPOINT_XFER_BULK,
-            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_FS),
             .bInterval = 0,
         },
         .sink = {
@@ -304,7 +304,7 @@ static const struct {
             .bDescriptorType = USB_DT_ENDPOINT,
             .bEndpointAddress = 2 | USB_DIR_IN,
             .bmAttributes = USB_ENDPOINT_XFER_BULK,
-            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_HS),
+            .wMaxPacketSize = bfdev_cpu_to_le16(MAX_PACKET_SIZE_FS),
             .bInterval = 0,
         },
     },
