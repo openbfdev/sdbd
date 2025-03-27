@@ -4,8 +4,13 @@
  */
 
 #include <stdint.h>
+#include <stddef.h>
 #include <stdbool.h>
+#include <stdio.h>
+#include <stdlib.h>
 #include <unistd.h>
+#include <string.h>
+#include <ctype.h>
 #include <getopt.h>
 #include <err.h>
 #include <pwd.h>
@@ -608,7 +613,8 @@ async_usb_enqueue(struct sdbd_ctx *sctx, const void *data, size_t size)
     int retval;
 
     for (;;) {
-        retval = bfenv_iothread_write(sctx->usbio_in, sctx->fd_in, data, size);
+        retval = bfenv_iothread_write(sctx->usbio_in, sctx->fd_in,
+            data, size, NULL);
         if (retval >= 0)
             break;
 
@@ -1050,12 +1056,11 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
 static int
 stream_append(struct sdbd_service *service, void *data, size_t size)
 {
-    void *buff;
+    int retval;
 
-    buff = bfdev_array_push(&service->stream, size);
-    if (!buff)
-        return -BFDEV_ENOMEM;
-    memcpy(buff, data, size);
+    retval = bfdev_array_append(&service->stream, data, size);
+    if (retval)
+        return retval;
 
     return -BFDEV_ENOERR;
 }
@@ -1073,7 +1078,7 @@ stream_accumulate(struct sdbd_service *service, size_t request,
     remain = request - alreary;
     avail = bfdev_min(remain, append);
 
-    retval = stream_append(service, data, append);
+    retval = stream_append(service, data, avail);
     if (retval < 0)
         return retval;
 
@@ -1766,7 +1771,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         return retval;
 
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
-        &sync->buff, sync->batch);
+        &sync->buff, sync->batch, NULL);
     if (retval < 0)
         return retval;
 
@@ -1794,7 +1799,7 @@ service_sync_recv(struct sdbd_sync_service *sync, char *filename)
     sync->event.func = service_sync_recv_handle;
 
     retval = bfenv_iothread_read(sync->fileio, sync->fd,
-        &sync->buff, sync->batch);
+        &sync->buff, sync->batch, NULL);
     if (retval < 0)
         return retval;
 
@@ -2668,7 +2673,7 @@ finish:
     /* reregister usbio read handler */
     bfdev_log_debug("usbio read: message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
-        &sctx->msgbuff, sizeof(sctx->msgbuff));
+        &sctx->msgbuff, sizeof(sctx->msgbuff), NULL);
     if (retval < 0)
         return retval;
 
@@ -2792,7 +2797,7 @@ usb_init(struct sdbd_ctx *sctx)
 
     bfdev_log_debug("usb init: read message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
-        &sctx->msgbuff, sizeof(sctx->msgbuff));
+        &sctx->msgbuff, sizeof(sctx->msgbuff), NULL);
     if (retval < 0)
         return retval;
 
