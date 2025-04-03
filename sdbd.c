@@ -1221,10 +1221,10 @@ spawn_shell(struct sdbd_shell_service *shell, int *amaster,
     setenv("TERM", value, 0);
 
     /* sdbd ignored sigint and sigchld */
-    signal(SIGINT, SIG_DFL);
+    signal(SIGUSR1, SIG_DFL);
     signal(SIGCHLD, SIG_DFL);
 
-    execl(path, path, cmdline ? "-c" : "-", cmdline, NULL);
+    execl(path, path, cmdline ? "-c" : NULL, cmdline, NULL);
     exit(1);
 }
 
@@ -2351,7 +2351,7 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
     local = sctx->args[1];
     psrv = bfdev_radix_find(&sctx->services, local);
     if (!psrv) {
-        bfdev_log_notice("service write: failed connect to %d\n", local);
+        bfdev_log_info("service write: failed connect to %d\n", local);
         return -BFDEV_ENOERR;
     }
 
@@ -2384,7 +2384,7 @@ service_okay(struct sdbd_ctx *sctx)
     local = sctx->args[1];
     psrv = bfdev_radix_find(&sctx->services, local);
     if (!psrv) {
-        bfdev_log_notice("service okay: failed connect to %d\n", local);
+        bfdev_log_info("service okay: failed connect to %d\n", local);
         return -BFDEV_ENOERR;
     }
 
@@ -2744,7 +2744,8 @@ sdbd_signal_handle(bfenv_eproc_event_t *event, void *pdata)
             waitpid(-1, NULL, WNOHANG);
             break;
 
-        case SIGINT:
+        case SIGUSR1:
+            bfdev_log_debug("signal handled: exiting\n");
             return -BFDEV_ECANCELED;
 
         default:
@@ -2839,7 +2840,7 @@ signal_init(struct sdbd_ctx *sctx)
     int sigfd, retval;
 
     sigemptyset(&mask);
-    sigaddset(&mask, SIGINT);
+    sigaddset(&mask, SIGUSR1);
     sigaddset(&mask, SIGCHLD);
 
     if (sigprocmask(SIG_BLOCK, &mask, NULL) < 0)
