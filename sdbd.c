@@ -34,7 +34,7 @@
 #define MODULE_NAME "sdbd"
 #define bfdev_log_fmt(fmt) MODULE_NAME ": " fmt
 
-#define SDBD_VERSION "v0.4"
+#define SDBD_VERSION "v0.5"
 #define SDBD_INFO MODULE_NAME "/" SDBD_VERSION
 
 #ifndef DEBUG
