@@ -1202,7 +1202,9 @@ spawn_shell(struct sdbd_shell_service *shell, int *amaster,
 
     pwd = getpwuid(getuid());
     if (pwd) {
-        chdir(pwd->pw_dir);
+        if (chdir(pwd->pw_dir))
+            exit(1);
+
         setenv("HOME", pwd->pw_dir, 0);
         setenv("USER", pwd->pw_name, 0);
         setenv("LOGNAME", pwd->pw_name, 0);
