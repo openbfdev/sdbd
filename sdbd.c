@@ -131,6 +131,7 @@ static bool sdbd_noaccel;
 
 static const char *sdbd_shell;
 static const char *sdbd_auth_file;
+static const char *sdbd_pid_file;
 static unsigned long sdbd_timeout = SERVICE_TIMEOUT;
 static BFDEV_LIST_HEAD(sdbd_auth_keys);
 
@@ -3137,6 +3138,32 @@ log_redirect_file(bfdev_log_message_t *msg, void *pdata)
 }
 
 static int
+generate_pidfile(const char *pidfile)
+{
+    char buff[64];
+    int pidfd, pid, retval;
+
+    pidfd = open(pidfile, O_CREAT | O_TRUNC | O_WRONLY, 0644);
+    if (pidfd < 0) {
+        fprintf(stderr, "Failed to open pidfile: '%s'\n", pidfile);
+        return 1;
+    }
+
+    pid = getpid();
+    snprintf(buff, sizeof(buff), "%d", pid);
+
+    retval = sdbd_write(pidfd, buff, strlen(buff));
+    if (retval < 0) {
+        fprintf(stderr, "Failed to write pidfile\n");
+        return 1;
+    }
+
+    close(pidfd);
+
+    return 0;
+}
+
+static int
 spawn_daemon(void)
 {
     pid_t pid;
@@ -3202,6 +3229,7 @@ usage(const char *path)
     fprintf(stderr, "  -x, --noaccel         Do not use hw acceleration.\n");
     fprintf(stderr, "  -n, --noauth          Do not use authentication.\n");
     fprintf(stderr, "  -a, --authfile=PATH   Selects a public key file.\n");
+    fprintf(stderr, "  -p, --pidfile=PATH    Generate PID file.\n");
     fprintf(stderr, "  -s, --syslog          Redirect logs to syslog.\n");
     fprintf(stderr, "  -f, --logfile=PATH    Redirect logs to file.\n");
     fprintf(stderr, "  -l, --loglevel=LEVEL  Set print log level threshold.\n");
@@ -3244,6 +3272,7 @@ options[] = {
     {"noaccel",   no_argument,        NULL, 'x'},
     {"noauth",    no_argument,        NULL, 'n'},
     {"authfile",  required_argument,  NULL, 'a'},
+    {"pidfile",   required_argument,  NULL, 'p'},
     {"syslog",    no_argument,        NULL, 's'},
     {"logfile",   required_argument,  NULL, 'f'},
     {"loglevel",  required_argument,  NULL, 'l'},
@@ -3263,7 +3292,7 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdxna:sf:l:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdxna:p:sf:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
@@ -3284,6 +3313,10 @@ main(int argc, char *const argv[])
                 sdbd_auth_file = optarg;
                 break;
 
+            case 'p':
+                sdbd_pid_file = optarg;
+                break;
+
             case 's':
                 openlog(MODULE_NAME, LOG_PID | LOG_CONS, LOG_DAEMON);
                 bfdev_log_default.write = log_redirect_syslog;
@@ -3293,7 +3326,7 @@ main(int argc, char *const argv[])
             case 'f':
                 logfd = open(optarg, O_CREAT | O_WRONLY | O_APPEND, 0644);
                 if (logfd < 0) {
-                    fprintf(stderr, "Failed to open log file: '%s'\n", optarg);
+                    fprintf(stderr, "Failed to open logfile: '%s'\n", optarg);
                     usage(argv[0]);
                 }
 
@@ -3338,6 +3371,12 @@ main(int argc, char *const argv[])
 
     if (sdbd_daemon) {
         retval = spawn_daemon();
+        if (retval < 0)
+            return retval;
+    }
+
+    if (sdbd_pid_file) {
+        retval = generate_pidfile(sdbd_pid_file);
         if (retval < 0)
             return retval;
     }
