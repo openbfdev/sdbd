@@ -1,0 +1,41 @@
+name: build on ubuntu
+
+on:
+  repository_dispatch:
+  workflow_dispatch:
+  push:
+  pull_request:
+  schedule:
+    - cron: '0 */2 * * *'
+
+env:
+  BUILD_TYPE: Release
+
+jobs:
+  build:
+    name: Test on ${{matrix.os}}
+    runs-on: ${{matrix.os}}
+    strategy:
+      matrix:
+        os: [ubuntu-22.04]
+
+    steps:
+      - name: checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: install dependencies
+        run: |
+          sudo apt update
+          sudo apt install cmake make gcc ccache
+          wget https://github.com/openbfdev/bfdev/releases/download/nightly/bfdev-debian-amd64.deb
+          wget https://github.com/openbfdev/bfenv/releases/download/nightly/bfenv-debian-amd64.deb
+          sudo dpkg -i bfdev-debian-amd64.deb bfenv-debian-amd64.deb
+
+      - name: make
+        run: |
+          make
+          make small
+          make reldbg
+          make debug
