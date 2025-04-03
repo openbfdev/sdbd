@@ -55,7 +55,7 @@ Usage:
 ```shell
 $ sdbd --help
 Usage: ./sdbd-reldbg [option] ...
-Simple Debug Bridge Daemon (SDBD) v0.4
+Simple Debug Bridge Daemon (SDBD) v0.5
 Hardware Acceleration: 'Arm Neon'
 
 Options:
