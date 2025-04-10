@@ -128,6 +128,7 @@ static bool sdbd_daemon;
 static bool sdbd_auth;
 static bool sdbd_noauth;
 static bool sdbd_noaccel;
+static bool sdbd_noescape;
 
 static const char *sdbd_shell;
 static const char *sdbd_auth_file;
@@ -416,6 +417,13 @@ static const struct {
     },
 };
 
+enum escape_state {
+    ESCAPE_NORM = 0,
+    ESCAPE_ESC,
+    ESCAPE_CSI,
+    ESCAPE_SS3,
+};
+
 struct sdbd_packet {
     uint32_t command;
     uint32_t args[2];
@@ -439,10 +447,14 @@ struct sdbd_shell_service {
     struct sdbd_service service;
     bfenv_eproc_event_t event;
     pid_t pid;
+    int pty;
 
     size_t inprogress;
     uint32_t cmd;
     uint32_t size;
+
+    bfdev_array_t escape_buff;
+    enum escape_state escape_state;
 
     bool v2;
     char *term;
@@ -549,6 +561,8 @@ sdbd_read(int fd, void *data, size_t size)
     ssize_t rlen;
 
     count = 0;
+    bfdev_log_debug("sdbd read: %zu bytes\n", size);
+
     do {
         rlen = read(fd, data, size - count);
         if (rlen >= 0) {
@@ -582,6 +596,8 @@ sdbd_write(int fd, const void *data, size_t size)
     ssize_t rlen;
 
     count = 0;
+    bfdev_log_debug("sdbd write: %zu bytes\n", size);
+
     do {
         rlen = write(fd, data, size - count);
         if (rlen >= 0) {
@@ -1229,6 +1245,96 @@ spawn_shell(struct sdbd_shell_service *shell, int *amaster,
     exit(1);
 }
 
+static bool
+escape_code(struct sdbd_shell_service *shell, char code)
+{
+    switch (shell->escape_state) {
+        case ESCAPE_NORM:
+            switch (code) {
+                case BFDEV_ASCII_ESC:
+                    shell->escape_state = ESCAPE_ESC;
+                    break;
+
+                default:
+                    return true;
+            }
+            break;
+
+        case ESCAPE_ESC:
+            switch (code) {
+                case '[':
+                    shell->escape_state = ESCAPE_CSI;
+                    break;
+
+                case 'O':
+                    shell->escape_state = ESCAPE_SS3;
+                    break;
+
+                default:
+                    shell->escape_state = ESCAPE_NORM;
+                    return true;
+            }
+            break;
+
+        case ESCAPE_CSI:
+            if (code >= '0' && code <= '9')
+                return false;
+
+            if (code == ';')
+                break;
+
+            shell->escape_state = ESCAPE_NORM;
+            return true;
+
+        case ESCAPE_SS3:
+            shell->escape_state = ESCAPE_NORM;
+            return true;
+
+        default:
+            BFDEV_BUG();
+    }
+
+    return false;
+}
+
+static int
+shell_write(struct sdbd_shell_service *shell, const void *data, size_t size)
+{
+    const char *ch;
+    size_t index;
+    int retval;
+
+    if (sdbd_noescape)
+        return sdbd_write(shell->pty, data, size);
+
+    ch = data;
+    for (index = 0; index < size; ++index) {
+        retval = bfdev_array_append(&shell->escape_buff, &ch[index], 1);
+        if (retval < 0) {
+            bfdev_log_err("shell write: escape buffer full\n");
+            return retval;
+        }
+
+        if (escape_code(shell, ch[index])) {
+            if (shell->escape_state == ESCAPE_ESC && ch[index] == BFDEV_ASCII_ESC)
+                retval = sdbd_write(shell->pty, "\e", 1);
+            else {
+                retval = sdbd_write(shell->pty,
+                    bfdev_array_data(&shell->escape_buff, 0),
+                    bfdev_array_size(&shell->escape_buff));
+            }
+
+            if (retval < 0) {
+                bfdev_log_err("shell write: escape write failed\n");
+                return retval;
+            }
+            bfdev_array_reset(&shell->escape_buff);
+        }
+    }
+
+    return -BFDEV_ENOERR;
+}
+
 static void
 service_shell_close(struct sdbd_service *service)
 {
@@ -1242,7 +1348,7 @@ service_shell_close(struct sdbd_service *service)
     bfenv_eproc_event_remove(service->sctx->eproc, &shell->event);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfdev_free(NULL, shell->term);
-    close(shell->event.fd);
+    close(shell->pty);
 
     bfdev_array_release(&service->stream);
     bfdev_radix_free(&service->sctx->services, service->local);
@@ -1261,7 +1367,7 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
     shell = bfdev_container_of(service, struct sdbd_shell_service, service);
     bfdev_log_debug("shell write: inprogress %zu\n", shell->inprogress);
     if (!shell->v2) {
-        retval = sdbd_write(shell->event.fd, data, length);
+        retval = shell_write(shell, data, length);
         if (retval < 0)
             return retval;
 
@@ -1276,7 +1382,7 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
 
             switch (shell->cmd) {
                 case SHELL_CMD_STDIN:
-                    retval = sdbd_write(shell->event.fd, data, size);
+                    retval = shell_write(shell, data, size);
                     if (retval < 0)
                         return retval;
                     break;
@@ -1318,7 +1424,7 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
                     wsize.ws_col = cols;
                     wsize.ws_xpixel = xpixs;
                     wsize.ws_ypixel = ypixs;
-                    ioctl(shell->event.fd, TIOCSWINSZ, &wsize);
+                    ioctl(shell->pty, TIOCSWINSZ, &wsize);
                     break;
                 }
             }
@@ -1474,6 +1580,8 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     shell->service.local = ++sctx->sockid;
     shell->service.write = service_shell_write;
     shell->service.close = service_shell_close;
+    shell->escape_state = ESCAPE_NORM;
+    bfdev_array_init(&shell->escape_buff, NULL, sizeof(uint8_t));
     bfdev_array_init(&shell->service.stream, NULL, sizeof(uint8_t));
 
     pid = spawn_shell(shell, &amaster, sdbd_shell, cmdline);
@@ -1481,6 +1589,8 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
 
     shell->pid = pid;
+    shell->pty = amaster;
+
     shell->event.fd = amaster;
     shell->event.flags = BFENV_EPROC_READ;
     shell->event.func = service_shell_handle;
@@ -3228,6 +3338,7 @@ usage(const char *path)
     fprintf(stderr, "  -d, --daemon          Run in daemon mode.\n");
     fprintf(stderr, "  -x, --noaccel         Do not use hw acceleration.\n");
     fprintf(stderr, "  -n, --noauth          Do not use authentication.\n");
+    fprintf(stderr, "  -e, --noescape        Do not merge escape characters.\n");
     fprintf(stderr, "  -a, --authfile=PATH   Selects a public key file.\n");
     fprintf(stderr, "  -p, --pidfile=PATH    Generate PID file.\n");
     fprintf(stderr, "  -s, --syslog          Redirect logs to syslog.\n");
@@ -3271,6 +3382,7 @@ options[] = {
     {"daemon",    no_argument,        NULL, 'd'},
     {"noaccel",   no_argument,        NULL, 'x'},
     {"noauth",    no_argument,        NULL, 'n'},
+    {"noescape",  no_argument,        NULL, 'e'},
     {"authfile",  required_argument,  NULL, 'a'},
     {"pidfile",   required_argument,  NULL, 'p'},
     {"syslog",    no_argument,        NULL, 's'},
@@ -3292,7 +3404,7 @@ main(int argc, char *const argv[])
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
     for (;;) {
-        arg = getopt_long(argc, argv, "hvdxna:p:sf:l:t:", options, &optidx);
+        arg = getopt_long(argc, argv, "hvdxnea:p:sf:l:t:", options, &optidx);
         if (arg == -1)
             break;
 
@@ -3307,6 +3419,10 @@ main(int argc, char *const argv[])
 
             case 'n':
                 sdbd_noauth = true;
+                break;
+
+            case 'e':
+                sdbd_noescape = true;
                 break;
 
             case 'a':
