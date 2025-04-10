@@ -1642,12 +1642,12 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
         }
 
         if (!strncmp(parse, SHELL_FUTURE_PTY, sizeof(SHELL_FUTURE_PTY) - 1)) {
-            parse += sizeof(SHELL_FUTURE_PTY) - 1;
+            bfdev_log_debug("shell open: pty type\n");
             shell->type = SHELL_PTY;
         }
 
         if (!strncmp(parse, SHELL_FUTURE_RAW, sizeof(SHELL_FUTURE_RAW) - 1)) {
-            parse += sizeof(SHELL_FUTURE_RAW) - 1;
+            bfdev_log_debug("shell open: raw type\n");
             shell->type = SHELL_RAW;
         }
 
