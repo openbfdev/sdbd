@@ -1700,13 +1700,28 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static struct sdbd_service *
+service_exec_open(struct sdbd_ctx *sctx, char *cmdline)
+{
+    struct sdbd_service *service;
+    char buff[MAX_PAYLOAD];
+
+    bfdev_log_notice("exec open: cmdline '%s'\n", cmdline);
+    bfdev_scnprintf(buff, sizeof(buff), "raw:%s", cmdline);
+    service = service_shell_open(sctx, buff);
+    if (!service)
+        return NULL;
+
+    return service;
+}
+
+static struct sdbd_service *
 service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
     char buff[MAX_PAYLOAD];
 
     bfdev_log_notice("reboot open: cmdline '%s'\n", cmdline);
-    bfdev_scnprintf(buff, sizeof(buff), ":reboot '%s'", cmdline);
+    bfdev_scnprintf(buff, sizeof(buff), ":reboot %s", cmdline);
     service = service_shell_open(sctx, buff);
     if (!service)
         return NULL;
@@ -2456,6 +2471,9 @@ static const struct {
     {
         .name = "shell",
         .open = service_shell_open,
+    }, {
+        .name = "exec:",
+        .open = service_exec_open,
     }, {
         .name = "reboot:",
         .open = service_reboot_open,
