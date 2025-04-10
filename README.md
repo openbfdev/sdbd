@@ -27,6 +27,7 @@
 
 ```shell
 $ adb shell [args] ... # interactive shell
+$ adb exec [args] ... # execute command
 $ adb reboot [args] ... # reboot device
 $ adb remount # remount /system
 $ adb push local-path remote-path # push files to device
