@@ -24,6 +24,7 @@
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/socket.h>
 #include <sys/types.h>
 #include <inttypes.h>
 #include <dirent.h>
@@ -424,6 +425,16 @@ enum escape_state {
     ESCAPE_SS3,
 };
 
+enum shell_type {
+    SHELL_PTY = 0,
+    SHELL_RAW,
+};
+
+enum shell_protocol {
+    SHELL_NONE = 0,
+    SHELL_SHELL,
+};
+
 struct sdbd_packet {
     uint32_t command;
     uint32_t args[2];
@@ -445,9 +456,12 @@ struct sdbd_service {
 
 struct sdbd_shell_service {
     struct sdbd_service service;
-    bfenv_eproc_event_t event;
+    bfenv_eproc_event_t stdinout_ev;
+    bfenv_eproc_event_t stderr_ev;
     pid_t pid;
-    int pty;
+
+    int stdinout_fd;
+    int stderr_fd;
 
     size_t inprogress;
     uint32_t cmd;
@@ -455,6 +469,9 @@ struct sdbd_shell_service {
 
     bfdev_array_t escape_buff;
     enum escape_state escape_state;
+
+    enum shell_type type;
+    enum shell_protocol protocol;
 
     bool v2;
     char *term;
@@ -1182,31 +1199,75 @@ iothread_release(bfenv_iothread_request_t *request, void *pdata)
     free(request->buffer);
 }
 
+static int
+create_socketpair(int *fd1, int *fd2)
+{
+    int sockets[2];
+    int retval;
+
+    retval = socketpair(AF_UNIX, SOCK_STREAM, 0, sockets);
+    if (retval < 0) {
+        bfdev_log_err("create socketpair: failed to create socket\n");
+        return retval;
+    }
+
+    *fd1 = sockets[0];
+    *fd2 = sockets[1];
+
+    return -BFDEV_ENOERR;
+}
+
 static pid_t
-spawn_shell(struct sdbd_shell_service *shell, int *amaster,
-            const char *path, char *cmdline)
+spawn_shell(struct sdbd_shell_service *shell, char *cmdline)
 {
     char ptsname[PATH_MAX], hostname[HOST_NAME_MAX];
     struct passwd *pwd;
-    int child, fd, maxfd;
-    int retval;
+    int child_stdinout, child_stderr;
+    int fd, maxfd, retval;
     pid_t pid;
     char *value;
 
-    pid = forkpty(amaster, ptsname, NULL, NULL);
-    if (pid != 0)
+    bfdev_log_debug("spawn shell: type '%s' protocol '%s'\n",
+        shell->type == SHELL_PTY ? "pty" : "raw",
+        shell->protocol == SHELL_SHELL ? "shell" : "none");
+
+    child_stdinout = -1;
+    child_stderr = -1;
+
+    if (shell->type == SHELL_PTY)
+        pid = forkpty(&shell->stdinout_fd, ptsname, NULL, NULL);
+    else { /* shell->type == SHELL_RAW */
+        retval = create_socketpair(&shell->stdinout_fd, &child_stdinout);
+        if (retval < 0)
+            return retval;
+
+        if (shell->protocol == SHELL_SHELL) {
+            retval = create_socketpair(&shell->stderr_fd, &child_stderr);
+            if (retval < 0)
+                return retval;
+        }
+
+        pid = fork();
+    }
+
+    if (pid != 0) {
+        close(child_stdinout);
+        close(child_stderr);
         return pid;
+    }
 
     /* Subprocess child. */
     setsid();
 
-    child = open(ptsname, O_RDWR);
-    if (child < 0)
-        exit(child);
+    if (shell->type == SHELL_PTY) {
+        child_stdinout = open(ptsname, O_RDWR);
+        if (child_stdinout < 0)
+            exit(child_stdinout);
+    }
 
-    dup2(child, STDIN_FILENO);
-    dup2(child, STDOUT_FILENO);
-    dup2(child, STDERR_FILENO);
+    dup2(child_stdinout, STDIN_FILENO);
+    dup2(child_stdinout, STDOUT_FILENO);
+    dup2(child_stderr != -1 ? child_stderr : child_stdinout, STDERR_FILENO);
 
     /* close the all fds except stdio */
     maxfd = sysconf(_SC_OPEN_MAX);
@@ -1241,7 +1302,7 @@ spawn_shell(struct sdbd_shell_service *shell, int *amaster,
     signal(SIGUSR1, SIG_DFL);
     signal(SIGCHLD, SIG_DFL);
 
-    execl(path, path, cmdline ? "-c" : NULL, cmdline, NULL);
+    execl(sdbd_shell, sdbd_shell, cmdline ? "-c" : "-", cmdline, NULL);
     exit(1);
 }
 
@@ -1305,7 +1366,7 @@ shell_write(struct sdbd_shell_service *shell, const void *data, size_t size)
     int retval;
 
     if (sdbd_noescape)
-        return sdbd_write(shell->pty, data, size);
+        return sdbd_write(shell->stdinout_fd, data, size);
 
     ch = data;
     for (index = 0; index < size; ++index) {
@@ -1317,9 +1378,9 @@ shell_write(struct sdbd_shell_service *shell, const void *data, size_t size)
 
         if (escape_code(shell, ch[index])) {
             if (ch[index] == BFDEV_ASCII_ESC)
-                retval = sdbd_write(shell->pty, "\e", 1);
+                retval = sdbd_write(shell->stdinout_fd, "\e", 1);
             else {
-                retval = sdbd_write(shell->pty,
+                retval = sdbd_write(shell->stdinout_fd,
                     bfdev_array_data(&shell->escape_buff, 0),
                     bfdev_array_size(&shell->escape_buff));
             }
@@ -1345,10 +1406,15 @@ service_shell_close(struct sdbd_service *service)
     send_close(shell->service.sctx, 0, shell->service.remote);
     kill(shell->pid, SIGKILL);
 
-    bfenv_eproc_event_remove(service->sctx->eproc, &shell->event);
+    if (shell->stderr_fd != -1) {
+        bfenv_eproc_event_remove(service->sctx->eproc, &shell->stderr_ev);
+        close(shell->stderr_fd);
+    }
+
+    bfenv_eproc_event_remove(service->sctx->eproc, &shell->stdinout_ev);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfdev_free(NULL, shell->term);
-    close(shell->pty);
+    close(shell->stdinout_fd);
 
     bfdev_array_release(&service->stream);
     bfdev_radix_free(&service->sctx->services, service->local);
@@ -1424,7 +1490,7 @@ service_shell_write(struct sdbd_service *service, void *data, size_t length)
                     wsize.ws_col = cols;
                     wsize.ws_xpixel = xpixs;
                     wsize.ws_ypixel = ypixs;
-                    ioctl(shell->pty, TIOCSWINSZ, &wsize);
+                    ioctl(shell->stdinout_fd, TIOCSWINSZ, &wsize);
                     break;
                 }
             }
@@ -1512,7 +1578,8 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_ENOERR;
     }
 
-    shellmsg.id = SHELL_CMD_STDOUT;
+    shellmsg.id = event->fd == shell->stderr_fd ?
+        SHELL_CMD_STDERR : SHELL_CMD_STDOUT;
     shellmsg.size = bfdev_cpu_to_le32(length);
 
     retval = send_data(shell->service.sctx, shell->service.local,
@@ -1533,13 +1600,18 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_shell_service *shell;
     struct sdbd_service **psrv;
-    int amaster, retval;
-    pid_t pid;
+    int retval;
 
     bfdev_log_notice("shell open: cmdline '%s'\n", cmdline);
     shell = bfdev_zalloc(NULL, sizeof(*shell));
     if (!shell)
         return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+
+    shell->stdinout_fd = -1;
+    shell->stderr_fd = -1;
+
+    shell->protocol = SHELL_NONE;
+    shell->type = cmdline ? SHELL_PTY : SHELL_RAW;
 
     for (;;) {
         unsigned long offset;
@@ -1557,6 +1629,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
         bfdev_log_debug("shell open: parse '%s'\n", parse);
         if (!strcmp(parse, SHELL_FUTURE_V2)) {
             bfdev_log_debug("shell open: enable v2\n");
+            shell->protocol = SHELL_SHELL;
             shell->v2 = true;
         }
 
@@ -1566,6 +1639,16 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
             shell->term = bfdev_strdup(NULL, parse);
             if (!shell->term)
                 return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+        }
+
+        if (!strncmp(parse, SHELL_FUTURE_PTY, sizeof(SHELL_FUTURE_PTY) - 1)) {
+            parse += sizeof(SHELL_FUTURE_PTY) - 1;
+            shell->type = SHELL_PTY;
+        }
+
+        if (!strncmp(parse, SHELL_FUTURE_RAW, sizeof(SHELL_FUTURE_RAW) - 1)) {
+            parse += sizeof(SHELL_FUTURE_RAW) - 1;
+            shell->type = SHELL_RAW;
         }
 
         if (sch == ':')
@@ -1584,21 +1667,29 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
     bfdev_array_init(&shell->escape_buff, NULL, sizeof(uint8_t));
     bfdev_array_init(&shell->service.stream, NULL, sizeof(uint8_t));
 
-    pid = spawn_shell(shell, &amaster, sdbd_shell, cmdline);
-    if (pid < 0)
+    shell->pid = spawn_shell(shell, cmdline);
+    if (shell->pid < 0)
         return BFDEV_ERR_PTR(-BFDEV_EFAULT);
 
-    shell->pid = pid;
-    shell->pty = amaster;
+    shell->stdinout_ev.fd = shell->stdinout_fd;
+    shell->stdinout_ev.flags = BFENV_EPROC_READ;
+    shell->stdinout_ev.func = service_shell_handle;
+    shell->stdinout_ev.pdata = shell;
 
-    shell->event.fd = amaster;
-    shell->event.flags = BFENV_EPROC_READ;
-    shell->event.func = service_shell_handle;
-    shell->event.pdata = shell;
-
-    retval = bfenv_eproc_event_add(sctx->eproc, &shell->event);
+    retval = bfenv_eproc_event_add(sctx->eproc, &shell->stdinout_ev);
     if (retval < 0)
         return BFDEV_ERR_PTR(retval);
+
+    if (shell->stderr_fd != -1) {
+        shell->stderr_ev.fd = shell->stderr_fd;
+        shell->stderr_ev.flags = BFENV_EPROC_READ;
+        shell->stderr_ev.func = service_shell_handle;
+        shell->stderr_ev.pdata = shell;
+
+        retval = bfenv_eproc_event_add(sctx->eproc, &shell->stderr_ev);
+        if (retval < 0)
+            return BFDEV_ERR_PTR(retval);
+    }
 
     psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
     if (!psrv)
@@ -3298,14 +3389,14 @@ spawn_daemon(void)
         return -BFDEV_ENXIO;
     }
 
-	if (isatty(STDIN_FILENO)) {
+    if (isatty(STDIN_FILENO)) {
         if (dup2(fd, STDIN_FILENO) < 0) {
             fprintf(stderr, "failed to dup stdin\n");
             return -BFDEV_ENXIO;
         }
     }
 
-	if (isatty(STDOUT_FILENO)) {
+    if (isatty(STDOUT_FILENO)) {
         if (dup2(fd, STDOUT_FILENO) < 0) {
             fprintf(stderr, "failed to dup stdout\n");
             return -BFDEV_ENXIO;
