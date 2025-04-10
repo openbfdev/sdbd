@@ -1316,7 +1316,7 @@ shell_write(struct sdbd_shell_service *shell, const void *data, size_t size)
         }
 
         if (escape_code(shell, ch[index])) {
-            if (shell->escape_state == ESCAPE_ESC && ch[index] == BFDEV_ASCII_ESC)
+            if (ch[index] == BFDEV_ASCII_ESC)
                 retval = sdbd_write(shell->pty, "\e", 1);
             else {
                 retval = sdbd_write(shell->pty,
