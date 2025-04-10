@@ -16,6 +16,7 @@
 - [x] Shell version 2, can change windows size
 - [x] Automatic timeout close for unresponsive services
 - [x] Cross endianness (Big-Endian / Little-Endian)
+- [x] Merge escape characters
 - [x] USB hot plugging
 - [x] Shell command
 - [x] Reboot command
@@ -62,7 +63,9 @@ Options:
   -h, --help            Display this information.
   -v, --version         Display version information.
   -d, --daemon          Run in daemon mode.
+  -x, --noaccel         Do not use hw acceleration.
   -n, --noauth          Do not use authentication.
+  -e, --noescape        Do not use escape buffer.
   -a, --authfile=PATH   Selects a public key file.
   -p, --pidfile=PATH    Generate PID file.
   -s, --syslog          Redirect logs to syslog.
