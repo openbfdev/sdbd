@@ -1365,7 +1365,7 @@ shell_write(struct sdbd_shell_service *shell, const void *data, size_t size)
     size_t index;
     int retval;
 
-    if (sdbd_noescape)
+    if (sdbd_noescape || shell->type == SHELL_RAW)
         return sdbd_write(shell->stdinout_fd, data, size);
 
     ch = data;
