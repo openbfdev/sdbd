@@ -1237,6 +1237,7 @@ spawn_shell(struct sdbd_shell_service *shell, char *cmdline)
 {
     char ptsname[PATH_MAX], hostname[HOST_NAME_MAX];
     struct passwd *pwd;
+    __bfdev_always_unused int dummy;
     int child_stdinout, child_stderr;
     int fd, maxfd, retval;
     pid_t pid;
@@ -1295,9 +1296,7 @@ spawn_shell(struct sdbd_shell_service *shell, char *cmdline)
 
     pwd = getpwuid(getuid());
     if (pwd) {
-        if (chdir(pwd->pw_dir))
-            exit(1);
-
+        dummy = chdir(pwd->pw_dir);
         setenv("HOME", pwd->pw_dir, 0);
         setenv("USER", pwd->pw_name, 0);
         setenv("LOGNAME", pwd->pw_name, 0);
@@ -2484,6 +2483,7 @@ static struct sdbd_service *
 service_root_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
+    __bfdev_always_unused int dummy;
     int retval;
 
     service = bfdev_zalloc(NULL, sizeof(*service));
@@ -2507,8 +2507,8 @@ service_root_open(struct sdbd_ctx *sctx, char *cmdline)
             return BFDEV_ERR_PTR(retval);
     } else {
         sdbd_origin_uid = getuid();
-        setuid(0);
-        setgid(0);
+        dummy = setuid(0);
+        dummy = setgid(0);
 
         retval = send_string(sctx, service->local, service->remote,
             "remote: restarting adbd as root\n");
@@ -2523,6 +2523,7 @@ static struct sdbd_service *
 service_unroot_open(struct sdbd_ctx *sctx, char *cmdline)
 {
     struct sdbd_service *service;
+    __bfdev_always_unused int dummy;
     int retval;
 
     service = bfdev_zalloc(NULL, sizeof(*service));
@@ -2547,8 +2548,8 @@ service_unroot_open(struct sdbd_ctx *sctx, char *cmdline)
 
         return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
     } else {
-        setuid(sdbd_origin_uid);
-        setgid(sdbd_origin_uid);
+        dummy = setuid(sdbd_origin_uid);
+        dummy = setgid(sdbd_origin_uid);
 
         retval = send_string(sctx, service->local, service->remote,
             "remote: restarting adbd as non root\n");
