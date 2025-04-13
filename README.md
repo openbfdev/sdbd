@@ -21,15 +21,20 @@
 - [x] Shell command
 - [x] Reboot command
 - [x] Remount command
+- [x] Execute command
+- [x] Root / Unroot command
 - [x] Intel SSE2 / Arm Neon HW acceleration
 
 ### Support commands
 
 ```shell
 $ adb shell [args] ... # interactive shell
-$ adb exec-out [args] ... # execute command
+$ adb exec-out [args] ... # execute command (stdout pipe)
+$ adb exec-in [args] ... # execute command (stdin pipe)
 $ adb reboot [args] ... # reboot device
 $ adb remount # remount /system
+$ adb root # restart as root
+$ adb unroot # restart as root
 $ adb push local-path remote-path # push files to device
 $ adb pull remote-path local-path # pull files from device
 ```
