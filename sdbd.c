@@ -131,6 +131,7 @@ static bool sdbd_noauth;
 static bool sdbd_noaccel;
 static bool sdbd_noescape;
 
+static int sdbd_origin_uid;
 static const char *sdbd_shell;
 static const char *sdbd_auth_file;
 static const char *sdbd_pid_file;
@@ -1088,6 +1089,12 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
 }
 
 static int
+send_string(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, const char *data)
+{
+    return send_datas(sctx, local, remote, (void *)data, strlen(data));
+}
+
+static int
 stream_append(struct sdbd_service *service, void *data, size_t size)
 {
     int retval;
@@ -1197,6 +1204,14 @@ static void
 iothread_release(bfenv_iothread_request_t *request, void *pdata)
 {
     free(request->buffer);
+}
+
+static void
+service_release(struct sdbd_service *service)
+{
+    bfdev_array_release(&service->stream);
+    bfdev_radix_free(&service->sctx->services, service->local);
+    bfdev_free(NULL, service);
 }
 
 static int
@@ -1418,7 +1433,7 @@ service_shell_close(struct sdbd_service *service)
 
     bfdev_array_release(&service->stream);
     bfdev_radix_free(&service->sctx->services, service->local);
-    bfdev_free(NULL, service);
+    bfdev_free(NULL, shell);
 }
 
 static int
@@ -1620,7 +1635,7 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
         parse = cmdline;
         offset = strcspn(cmdline, ",:");
         if (!cmdline[offset])
-            return NULL;
+            return BFDEV_ERR_PTR(-BFDEV_EINVAL);
 
         cmdline += offset;
         sch = *cmdline;
@@ -1780,7 +1795,7 @@ service_sync_status(struct sdbd_sync_service *sync, uint32_t cmd, char *msg)
         return retval;
 
     if (length) {
-        retval = send_data(sync->service.sctx, sync->service.local,
+        retval = send_datas(sync->service.sctx, sync->service.local,
             sync->service.remote, msg, length);
         if (retval < 0)
             return retval;
@@ -1792,10 +1807,13 @@ service_sync_status(struct sdbd_sync_service *sync, uint32_t cmd, char *msg)
 static int
 service_sync_fail(struct sdbd_sync_service *sync, char *msg)
 {
+    char buff[256];
     int retval;
 
     bfdev_log_warn("service sync fail: '%s'\n", msg);
-    retval = service_sync_status(sync, SYNC_CMD_FAIL, msg);
+    snprintf(buff, sizeof(buff), "remote: %s", msg);
+
+    retval = service_sync_status(sync, SYNC_CMD_FAIL, buff);
     if (retval < 0)
         return retval;
 
@@ -2464,6 +2482,85 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     return &sync->service;
 }
 
+static struct sdbd_service *
+service_root_open(struct sdbd_ctx *sctx, char *cmdline)
+{
+    struct sdbd_service *service;
+    int retval;
+
+    service = bfdev_zalloc(NULL, sizeof(*service));
+    if (!service)
+        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+
+    service->sctx = sctx;
+    service->remote = sctx->args[0];
+    service->local = ++sctx->sockid;
+    service->close = service_release;
+    bfdev_array_init(&service->stream, NULL, sizeof(uint8_t));
+
+    retval = send_okay(sctx, service->local, service->remote);
+    if (retval < 0)
+        return BFDEV_ERR_PTR(retval);
+
+    if (getuid() == 0) {
+        retval = send_string(sctx, service->local, service->remote,
+            "remote: already running as root\n");
+        if (retval < 0)
+            return BFDEV_ERR_PTR(retval);
+    } else {
+        sdbd_origin_uid = getuid();
+        setuid(0);
+        setgid(0);
+
+        retval = send_string(sctx, service->local, service->remote,
+            "remote: restarting adbd as root\n");
+        if (retval < 0)
+            return BFDEV_ERR_PTR(retval);
+    }
+
+    return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
+}
+
+static struct sdbd_service *
+service_unroot_open(struct sdbd_ctx *sctx, char *cmdline)
+{
+    struct sdbd_service *service;
+    int retval;
+
+    service = bfdev_zalloc(NULL, sizeof(*service));
+    if (!service)
+        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+
+    service->sctx = sctx;
+    service->remote = sctx->args[0];
+    service->local = ++sctx->sockid;
+    service->close = service_release;
+    bfdev_array_init(&service->stream, NULL, sizeof(uint8_t));
+
+    retval = send_okay(sctx, service->local, service->remote);
+    if (retval < 0)
+        return BFDEV_ERR_PTR(retval);
+
+    if (getuid() != 0) {
+        retval = send_string(sctx, service->local, service->remote,
+            "remote: already running as non root\n");
+        if (retval < 0)
+            return BFDEV_ERR_PTR(retval);
+
+        return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
+    } else {
+        setuid(sdbd_origin_uid);
+        setgid(sdbd_origin_uid);
+
+        retval = send_string(sctx, service->local, service->remote,
+            "remote: restarting adbd as non root\n");
+        if (retval < 0)
+            return BFDEV_ERR_PTR(retval);
+    }
+
+    return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
+}
+
 static const struct {
     const char *name;
     struct sdbd_service *(*open)(struct sdbd_ctx *sctx, char *cmdline);
@@ -2483,6 +2580,12 @@ static const struct {
     }, {
         .name = "sync:",
         .open = service_sync_open,
+    }, {
+        .name = "root:",
+        .open = service_root_open,
+    }, {
+        .name = "unroot:",
+        .open = service_unroot_open,
     },
 };
 
@@ -2533,9 +2636,6 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
 
         cmdline += length;
         service = services[index].open(sctx, cmdline);
-        if (!service)
-            break;
-
         if (BFDEV_IS_INVAL(service))
             return BFDEV_PTR_INVAL(service);
 
@@ -2979,12 +3079,12 @@ static int
 usb_init_send(int fd)
 {
     if (write(fd, &adb_desc, sizeof(adb_desc)) != sizeof(adb_desc)) {
-        bfdev_log_err("send adb descriptors failed\n");
+        bfdev_log_err("send adb descriptors failed: %d\n", errno);
         return -BFDEV_EFAULT;
     }
 
     if (write(fd, &adb_str, sizeof(adb_str)) != sizeof(adb_str)) {
-        bfdev_log_err("send adb strings failed\n");
+        bfdev_log_err("send adb strings failed: %d\n", errno);
         return -BFDEV_EFAULT;
     }
 
@@ -3018,6 +3118,44 @@ usb_init(struct sdbd_ctx *sctx)
         return -BFDEV_EACCES;
     }
 
+    sctx->usbio_out = bfenv_iothread_create(NULL, 1,
+        BFENV_IOTHREAD_SIGREAD);
+    if (!sctx->usbio_out) {
+        bfdev_log_err("usbio out iothread create failed\n");
+        return -BFDEV_ESRCH;
+    }
+
+    sctx->usbio_in = bfenv_iothread_create(NULL, USB_FIFO_DEPTH,
+        BFENV_IOTHREAD_SIGWRITE);
+    if (!sctx->usbio_in) {
+        bfdev_log_err("usbio in iothread create failed\n");
+        return -BFDEV_ESRCH;
+    }
+
+    sctx->usbev_out.fd = sctx->usbio_out->eventfd;
+    sctx->usbev_out.flags = BFENV_EPROC_READ;
+    sctx->usbev_out.priority = -100;
+    sctx->usbev_out.func = sdbd_usb_out_handle;
+    sctx->usbev_out.pdata = sctx;
+
+    sctx->usbev_in.fd = sctx->usbio_in->eventfd;
+    sctx->usbev_in.flags = BFENV_EPROC_READ;
+    sctx->usbev_in.priority = -100;
+    sctx->usbev_in.func = sdbd_usb_in_handle;
+    sctx->usbev_in.pdata = sctx;
+
+    retval = bfenv_eproc_event_add(sctx->eproc, &sctx->usbev_out);
+    if (retval < 0) {
+        bfdev_log_err("register usb out event failed\n");
+        return -BFDEV_ESRCH;
+    }
+
+    retval = bfenv_eproc_event_add(sctx->eproc, &sctx->usbev_in);
+    if (retval < 0) {
+        bfdev_log_err("register usb in event failed\n");
+        return -BFDEV_ESRCH;
+    }
+
     bfdev_log_debug("usb init: read message\n");
     retval = bfenv_iothread_read(sctx->usbio_out, sctx->fd_out,
         &sctx->msgbuff, sizeof(sctx->msgbuff), NULL);
@@ -3030,6 +3168,11 @@ usb_init(struct sdbd_ctx *sctx)
 static void
 usb_close(struct sdbd_ctx *sctx)
 {
+    bfenv_eproc_event_remove(sctx->eproc, &sctx->usbev_out);
+    bfenv_eproc_event_remove(sctx->eproc, &sctx->usbev_in);
+    bfenv_iothread_destory(sctx->usbio_out, NULL, NULL);
+    bfenv_iothread_destory(sctx->usbio_in, iothread_release, NULL);
+
     close(sctx->fd_ctr);
     close(sctx->fd_out);
     close(sctx->fd_in);
@@ -3209,6 +3352,8 @@ sdbd(void)
 
     bzero(&sctx, sizeof(sctx));
     sctx.services = BFDEV_RADIX_INIT(&sctx.services, NULL);
+    sctx.version = ADB_VERSION;
+    sctx.max_payload = MAX_PAYLOAD;
 
     sctx.eproc = bfenv_eproc_create(NULL, "epoll");
     if (!sctx.eproc) {
@@ -3238,47 +3383,6 @@ sdbd(void)
         bfdev_log_err("signal initialization failed\n");
         goto error;
     }
-
-    sctx.usbio_out = bfenv_iothread_create(NULL, 1,
-        BFENV_IOTHREAD_SIGREAD);
-    if (!sctx.usbio_out) {
-        bfdev_log_err("usbio out iothread create failed\n");
-        goto error;
-    }
-
-    sctx.usbio_in = bfenv_iothread_create(NULL, USB_FIFO_DEPTH,
-        BFENV_IOTHREAD_SIGWRITE);
-    if (!sctx.usbio_in) {
-        bfdev_log_err("usbio in iothread create failed\n");
-        goto error;
-    }
-
-    sctx.usbev_out.fd = sctx.usbio_out->eventfd;
-    sctx.usbev_out.flags = BFENV_EPROC_READ;
-    sctx.usbev_out.priority = -100;
-    sctx.usbev_out.func = sdbd_usb_out_handle;
-    sctx.usbev_out.pdata = &sctx;
-
-    sctx.usbev_in.fd = sctx.usbio_in->eventfd;
-    sctx.usbev_in.flags = BFENV_EPROC_READ;
-    sctx.usbev_in.priority = -100;
-    sctx.usbev_in.func = sdbd_usb_in_handle;
-    sctx.usbev_in.pdata = &sctx;
-
-    retval = bfenv_eproc_event_add(sctx.eproc, &sctx.usbev_out);
-    if (retval < 0) {
-        bfdev_log_err("register usb out event failed\n");
-        goto error;
-    }
-
-    retval = bfenv_eproc_event_add(sctx.eproc, &sctx.usbev_in);
-    if (retval < 0) {
-        bfdev_log_err("register usb in event failed\n");
-        goto error;
-    }
-
-    sctx.version = ADB_VERSION;
-    sctx.max_payload = MAX_PAYLOAD;
 
     retval = usb_init(&sctx);
     if (retval < 0) {
@@ -3315,10 +3419,6 @@ finish:
     bfdev_radix_release(&sctx.services);
 
     usb_close(&sctx);
-    bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_out);
-    bfenv_eproc_event_remove(sctx.eproc, &sctx.usbev_in);
-    bfenv_iothread_destory(sctx.usbio_out, NULL, NULL);
-    bfenv_iothread_destory(sctx.usbio_in, iothread_release, NULL);
     bfenv_eproc_destory(sctx.eproc);
     bfdev_log_debug("finish exit\n");
 
