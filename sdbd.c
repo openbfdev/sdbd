@@ -655,7 +655,7 @@ async_usb_enqueue(struct sdbd_ctx *sctx, const void *data, size_t size)
 
         switch (retval) {
             case -BFDEV_EAGAIN:
-                bfdev_log_debug("async usb write: iowaitting...\n");\
+                bfdev_log_debug("async usb write: iowaitting...\n");
                 usleep(ASYNC_IOWAIT_TIME);
                 break;
 
@@ -2968,8 +2968,10 @@ sdbd_usb_out_handle(bfenv_eproc_event_t *event, void *pdata)
     BFDEV_BUG_ON(deepth != 1);
 
     if (bfdev_unlikely(request.error)) {
-        if (request.error == ESHUTDOWN)
+        if (request.error == ESHUTDOWN) {
+            bfdev_log_notice("usb out handled: usb disconnected\n");
             return -BFDEV_ESHUTDOWN;
+        }
 
         bfdev_log_err("usb out handled: error %d\n", request.error);
         return -BFDEV_EFAULT;
@@ -3027,8 +3029,10 @@ sdbd_usb_in_handle(bfenv_eproc_event_t *event, void *pdata)
         BFDEV_BUG_ON(deepth != 1);
 
         if (bfdev_unlikely(request.error)) {
-            if (request.error == ESHUTDOWN)
+            if (request.error == ESHUTDOWN) {
+                bfdev_log_notice("usb in handled: usb disconnected\n");
                 return -BFDEV_ESHUTDOWN;
+            }
 
             bfdev_log_err("usb in handled: error %d\n", request.error);
             return -BFDEV_EFAULT;
@@ -3395,11 +3399,10 @@ sdbd(void)
         retval = bfenv_eproc_run(sctx.eproc, BFENV_TIMEOUT_MAX);
         if (!retval)
             continue;
-        sdbd_exception(retval);
 
         switch (retval) {
             case -BFDEV_ESHUTDOWN:
-                bfdev_log_notice("usb disconnected\n");
+                bfdev_log_warn("usb reconnecting\n");
                 sctx.verified = false;
                 service_close_all(&sctx);
                 retval = usb_kick(&sctx);
@@ -3408,9 +3411,11 @@ sdbd(void)
                 break;
 
             case -BFDEV_ECANCELED:
+                bfdev_log_warn("user canceled\n");
                 goto finish;
 
             default:
+                sdbd_exception(retval);
                 goto error;
         }
     }
