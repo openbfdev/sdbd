@@ -24,6 +24,7 @@
 #include <sys/eventfd.h>
 #include <sys/signalfd.h>
 #include <sys/stat.h>
+#include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/types.h>
 #include <inttypes.h>
@@ -549,28 +550,6 @@ kexpectedpad_sha256_rsa2048[BFDEV_SHA256_DIGEST_SIZE] = {
 
 static int
 service_sync_write(struct sdbd_service *service, void *data, size_t length);
-
-static ssize_t
-path_read(const char *path, char *buff, size_t size)
-{
-    ssize_t length;
-    int fd;
-
-    fd = open(path, O_RDONLY);
-    if (bfdev_unlikely(fd < 0)) {
-        bfdev_log_err("path read: failed to open file");
-        return -BFDEV_EACCES;
-    }
-
-    length = read(fd, buff, size);
-    if (bfdev_unlikely(length <= 0)) {
-        bfdev_log_err("path read: failed to open file");
-        return -BFDEV_EFAULT;
-    }
-
-    close(fd);
-    return length;
-}
 
 static int
 sdbd_read(int fd, void *data, size_t size)
@@ -3374,7 +3353,7 @@ sdbd(void)
         }
     }
 
-    retval = path_read("/dev/random", (void *)&seed, sizeof(seed));
+    retval = getrandom(&seed, sizeof(seed), GRND_RANDOM);
     if (retval != sizeof(seed)) {
         bfdev_log_err("failed to read seed\n");
         goto error;
