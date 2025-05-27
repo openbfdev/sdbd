@@ -3476,7 +3476,7 @@ spawn_daemon(void)
     pid = fork();
     switch (pid) {
         case -1:
-            fprintf(stderr, "failed to fork daemon\n");
+            fprintf(stderr, "Failed to fork daemon\n");
             return -BFDEV_EFAULT;
 
         case 0:
@@ -3488,27 +3488,27 @@ spawn_daemon(void)
 
     fd = open("/dev/null", O_RDWR);
     if (fd < 0) {
-        fprintf(stderr, "failed to open null\n");
+        fprintf(stderr, "Failed to open null\n");
         return -BFDEV_ENXIO;
     }
 
     if (isatty(STDIN_FILENO)) {
         if (dup2(fd, STDIN_FILENO) < 0) {
-            fprintf(stderr, "failed to dup stdin\n");
+            fprintf(stderr, "Failed to dup stdin\n");
             return -BFDEV_ENXIO;
         }
     }
 
     if (isatty(STDOUT_FILENO)) {
         if (dup2(fd, STDOUT_FILENO) < 0) {
-            fprintf(stderr, "failed to dup stdout\n");
+            fprintf(stderr, "Failed to dup stdout\n");
             return -BFDEV_ENXIO;
         }
     }
 
     if (isatty(STDERR_FILENO)) {
         if (dup2(fd, STDERR_FILENO) < 0) {
-            fprintf(stderr, "failed to dup stdout\n");
+            fprintf(stderr, "Failed to dup stdout\n");
             return -BFDEV_ENXIO;
         }
     }
@@ -3591,6 +3591,7 @@ main(int argc, char *const argv[])
 {
     unsigned long value;
     int arg, optidx, logfd;
+    struct stat stbuf;
     int retval;
 
     logfd = -1;
@@ -3678,6 +3679,11 @@ main(int argc, char *const argv[])
     sdbd_shell = getenv("SHELL");
     if (!sdbd_shell)
         sdbd_shell = "/bin/sh";
+
+    if (stat(sdbd_shell, &stbuf)) {
+        fprintf(stderr, "Shell interpreter not found: '%s'\n", sdbd_shell);
+        exit(1);
+    }
 
     if (sdbd_daemon) {
         retval = spawn_daemon();
