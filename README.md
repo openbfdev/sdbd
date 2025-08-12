@@ -19,6 +19,7 @@
 - [x] Merge escape characters
 - [x] USB hot plugging
 - [x] Shell command
+- [x] TCP forward
 - [x] Reboot command
 - [x] Remount command
 - [x] Execute command
@@ -31,6 +32,7 @@
 $ adb shell [args] ... # interactive shell
 $ adb exec-out [args] ... # execute command (stdout pipe)
 $ adb exec-in [args] ... # execute command (stdin pipe)
+$ adb forward [args] ... # tcp port forward
 $ adb reboot [args] ... # reboot device
 $ adb remount # remount /system
 $ adb root # restart as root
