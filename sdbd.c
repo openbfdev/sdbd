@@ -4018,7 +4018,6 @@ main(int argc, char *const argv[])
 {
     unsigned long value;
     int arg, optidx, logfd;
-    struct stat stbuf;
     int retval;
 
     logfd = -1;
@@ -4107,8 +4106,8 @@ main(int argc, char *const argv[])
     if (!sdbd_shell)
         sdbd_shell = "/bin/sh";
 
-    if (stat(sdbd_shell, &stbuf)) {
-        fprintf(stderr, "Shell interpreter not found: '%s'\n", sdbd_shell);
+    if (access(sdbd_shell, X_OK)) {
+        fprintf(stderr, "Shell interpreter error: '%s' (%m)\n", sdbd_shell);
         exit(1);
     }
 
