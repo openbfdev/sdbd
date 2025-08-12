@@ -81,6 +81,8 @@
 
 /* SYNC Service Command */
 #define SYNC_CMD_STAT 0x54415453
+#define SYNC_CMD_STA2 0x32415453
+#define SYNC_CMD_LST2 0x3254534c
 #define SYNC_CMD_LIST 0x5453494c
 #define SYNC_CMD_SEND 0x444e4553
 #define SYNC_CMD_RECV 0x56434552
@@ -152,7 +154,7 @@ cnxn_values[] = {
     "Linux",
     "Systemd",
     "GNU",
-    "shell_v2,cmd",
+    "shell_v2,stat_v2,cmd",
 };
 
 static const char * const
@@ -192,6 +194,21 @@ struct sync_stat {
     bfdev_le32 mode;
     bfdev_le32 size;
     bfdev_le32 time;
+} __bfdev_packed;
+
+struct sync_stat2 {
+    bfdev_le32 id;
+    bfdev_le32 error;
+    bfdev_le64 dev;
+    bfdev_le64 ino;
+    bfdev_le32 mode;
+    bfdev_le32 nlink;
+    bfdev_le32 uid;
+    bfdev_le32 gid;
+    bfdev_le64 size;
+    bfdev_le64 atime;
+    bfdev_le64 mtime;
+    bfdev_le64 ctime;
 } __bfdev_packed;
 
 struct sync_directry {
@@ -1804,16 +1821,78 @@ static int
 service_sync_stat(struct sdbd_sync_service *sync)
 {
     struct sync_stat syncmsg;
-    struct stat stat;
+    struct stat stbuf;
     int retval;
 
     bzero(&syncmsg, sizeof(syncmsg));
     syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_STAT);
 
-    if (!lstat(sync->filename, &stat)) {
-        syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
-        syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
-        syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
+    if (!lstat(sync->filename, &stbuf)) {
+        syncmsg.mode = bfdev_cpu_to_le32(stbuf.st_mode);
+        syncmsg.size = bfdev_cpu_to_le32(stbuf.st_size);
+        syncmsg.time = bfdev_cpu_to_le32(stbuf.st_mtime);
+    }
+
+    retval = send_data(sync->service.sctx, sync->service.local,
+        sync->service.remote, &syncmsg, sizeof(syncmsg));
+    if (bfdev_unlikely(retval < 0))
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_sync_stat2(struct sdbd_sync_service *sync)
+{
+    struct sync_stat2 syncmsg;
+    struct stat stbuf;
+    int retval;
+
+    bzero(&syncmsg, sizeof(syncmsg));
+    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_STA2);
+
+    if (!stat(sync->filename, &stbuf)) {
+        syncmsg.dev = bfdev_cpu_to_le64(stbuf.st_dev);
+        syncmsg.ino = bfdev_cpu_to_le64(stbuf.st_ino);
+        syncmsg.mode = bfdev_cpu_to_le32(stbuf.st_mode);
+        syncmsg.nlink = bfdev_cpu_to_le32(stbuf.st_nlink);
+        syncmsg.uid = bfdev_cpu_to_le32(stbuf.st_uid);
+        syncmsg.gid = bfdev_cpu_to_le32(stbuf.st_gid);
+        syncmsg.size = bfdev_cpu_to_le64(stbuf.st_size);
+        syncmsg.atime = bfdev_cpu_to_le64(stbuf.st_atime);
+        syncmsg.mtime = bfdev_cpu_to_le64(stbuf.st_mtime);
+        syncmsg.ctime = bfdev_cpu_to_le64(stbuf.st_ctime);
+    }
+
+    retval = send_data(sync->service.sctx, sync->service.local,
+        sync->service.remote, &syncmsg, sizeof(syncmsg));
+    if (bfdev_unlikely(retval < 0))
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_sync_lstat2(struct sdbd_sync_service *sync)
+{
+    struct sync_stat2 syncmsg;
+    struct stat stbuf;
+    int retval;
+
+    bzero(&syncmsg, sizeof(syncmsg));
+    syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_LST2);
+
+    if (!lstat(sync->filename, &stbuf)) {
+        syncmsg.dev = bfdev_cpu_to_le64(stbuf.st_dev);
+        syncmsg.ino = bfdev_cpu_to_le64(stbuf.st_ino);
+        syncmsg.mode = bfdev_cpu_to_le32(stbuf.st_mode);
+        syncmsg.nlink = bfdev_cpu_to_le32(stbuf.st_nlink);
+        syncmsg.uid = bfdev_cpu_to_le32(stbuf.st_uid);
+        syncmsg.gid = bfdev_cpu_to_le32(stbuf.st_gid);
+        syncmsg.size = bfdev_cpu_to_le64(stbuf.st_size);
+        syncmsg.atime = bfdev_cpu_to_le64(stbuf.st_atime);
+        syncmsg.mtime = bfdev_cpu_to_le64(stbuf.st_mtime);
+        syncmsg.ctime = bfdev_cpu_to_le64(stbuf.st_ctime);
     }
 
     retval = send_data(sync->service.sctx, sync->service.local,
@@ -2421,6 +2500,18 @@ service_sync_write_name(struct sdbd_service *service, void *data, size_t length)
                 return retval;
             goto finish;
 
+        case SYNC_CMD_STA2: /* header + filename */
+            retval = service_sync_stat2(sync);
+            if (bfdev_unlikely(retval < 0))
+                return retval;
+            goto finish;
+
+        case SYNC_CMD_LST2: /* header + filename */
+            retval = service_sync_lstat2(sync);
+            if (bfdev_unlikely(retval < 0))
+                return retval;
+            goto finish;
+
         case SYNC_CMD_LIST: /* header + filename */
             retval = service_sync_list(sync);
             if (bfdev_unlikely(retval < 0))
@@ -2503,6 +2594,8 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
 
     switch (sync->cmd) {
         case SYNC_CMD_STAT:
+        case SYNC_CMD_STA2:
+        case SYNC_CMD_LST2:
         case SYNC_CMD_LIST:
         case SYNC_CMD_RECV:
         case SYNC_CMD_SEND:
