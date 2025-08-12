@@ -1215,6 +1215,7 @@ static void
 service_release(struct sdbd_service *service)
 {
     bfdev_array_release(&service->stream);
+    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfdev_radix_free(&service->sctx->services, service->local);
     bfdev_free(NULL, service);
 }
