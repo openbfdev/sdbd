@@ -491,6 +491,7 @@ struct sdbd_sync_service {
     size_t inprogress;
     size_t batch;
     char filename[SYNC_MAXNAME + 1];
+    char symlink[SYNC_MAXDATA + 1];
     uint8_t buff[];
 };
 
@@ -1800,7 +1801,7 @@ service_sync_fail(struct sdbd_sync_service *sync, char *msg)
 }
 
 static int
-service_sync_stat(struct sdbd_sync_service *sync, char *filename)
+service_sync_stat(struct sdbd_sync_service *sync)
 {
     struct sync_stat syncmsg;
     struct stat stat;
@@ -1809,7 +1810,7 @@ service_sync_stat(struct sdbd_sync_service *sync, char *filename)
     bzero(&syncmsg, sizeof(syncmsg));
     syncmsg.id = bfdev_cpu_to_le32(SYNC_CMD_STAT);
 
-    if (!lstat(filename, &stat)) {
+    if (!lstat(sync->filename, &stat)) {
         syncmsg.mode = bfdev_cpu_to_le32(stat.st_mode);
         syncmsg.size = bfdev_cpu_to_le32(stat.st_size);
         syncmsg.time = bfdev_cpu_to_le32(stat.st_mtime);
@@ -1824,7 +1825,7 @@ service_sync_stat(struct sdbd_sync_service *sync, char *filename)
 }
 
 static int
-service_sync_list(struct sdbd_sync_service *sync, char *filename)
+service_sync_list(struct sdbd_sync_service *sync)
 {
     char buffer[PATH_MAX + 1], *fname;
     struct sync_directry syncmsg;
@@ -1834,14 +1835,14 @@ service_sync_list(struct sdbd_sync_service *sync, char *filename)
     int retval;
     DIR *dir;
 
-    pathlen = strlen(filename);
+    pathlen = strlen(sync->filename);
     BFDEV_BUG_ON(pathlen + 1 > PATH_MAX);
 
-    memcpy(buffer, filename, pathlen);
+    memcpy(buffer, sync->filename, pathlen);
     buffer[pathlen++] = '/';
     fname = buffer + pathlen;
 
-    dir = opendir(filename);
+    dir = opendir(sync->filename);
     if (bfdev_unlikely(!dir))
         goto done;
 
@@ -1993,14 +1994,14 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
 }
 
 static int
-service_sync_recv(struct sdbd_sync_service *sync, char *filename)
+service_sync_recv(struct sdbd_sync_service *sync)
 {
     int retval;
 
-    sync->fd = open(filename, O_RDONLY);
+    sync->fd = open(sync->filename, O_RDONLY);
     if (bfdev_unlikely(sync->fd < 0)) {
         bfdev_log_warn("sync recv: failed to open file '%s' error %d\n",
-            filename, errno);
+            sync->filename, errno);
 
         retval = service_sync_fail(sync, "failed to open file");
         if (bfdev_unlikely(retval < 0))
@@ -2090,6 +2091,7 @@ sync_send_file_write(struct sdbd_service *service, void *data, size_t length)
                 bfdev_log_debug("sync send file write: wait header\n");
                 return -BFDEV_ENOERR;
             }
+
             bfdev_log_err("sync send file write: wait failed\n");
             retval = retlen;
             goto failed;
@@ -2167,29 +2169,29 @@ failed:
 }
 
 static int
-sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode,
+sync_send_file(struct sdbd_sync_service *sync, mode_t mode,
                void *data, size_t length)
 {
     int retval;
 
-    sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
+    sync->fd = open(sync->filename, O_WRONLY | O_NONBLOCK |
         O_CREAT | O_EXCL, mode);
     if (sync->fd < 0 && errno == ENOENT) {
-        recursion_mkdir(filename);
+        recursion_mkdir(sync->filename);
 
         /* no directory, try again */
-        sync->fd = open(filename, O_WRONLY | O_NONBLOCK |
+        sync->fd = open(sync->filename, O_WRONLY | O_NONBLOCK |
             O_CREAT | O_EXCL, mode);
     }
 
     if (sync->fd < 0 && errno == EEXIST) {
         /* file exist, try again */
-        sync->fd = open(filename, O_WRONLY | O_NONBLOCK, mode);
+        sync->fd = open(sync->filename, O_WRONLY | O_NONBLOCK, mode);
     }
 
     if (bfdev_unlikely(sync->fd < 0)) {
         bfdev_log_warn("sync send file: failed to open file '%s' error %d\n",
-            filename, errno);
+            sync->filename, errno);
 
         retval = service_sync_fail(sync, "failed to open file");
         if (bfdev_unlikely(retval < 0))
@@ -2199,7 +2201,7 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode,
     }
 
     bfdev_log_debug("sync send file: started '%s' mode %o\n",
-        filename, mode);
+        sync->filename, mode);
 
     sync->service.write = sync_send_file_write;
     retval = sync_send_file_write(&sync->service, data, length);
@@ -2210,13 +2212,137 @@ sync_send_file(struct sdbd_sync_service *sync, char *filename, mode_t mode,
 }
 
 static int
-sync_send_link(struct sdbd_sync_service *sync, char *filename)
+sync_send_link_write(struct sdbd_service *service, void *data, size_t length)
 {
-    return -BFDEV_EPROTONOSUPPORT;
+    struct sdbd_sync_service *sync;
+    struct sync_data *syncmsg;
+    uint32_t cmd, size;
+    ssize_t retlen;
+    int retval;
+
+    sync = bfdev_container_of(service, struct sdbd_sync_service, service);
+    bfdev_log_debug("sync send link write: inprogress %zu\n", sync->inprogress);
+
+    while (length) {
+        if (sync->inprogress) {
+            size = bfdev_min(sync->inprogress, length);
+            bfdev_log_debug("sync send link write: append %d\n", size);
+            strncat(sync->symlink, data, size);
+
+            length -= size;
+            data += size;
+            sync->inprogress -= size;
+
+            continue;
+        }
+
+        retlen = stream_accumulate(&sync->service,
+            sizeof(*syncmsg), data, length);
+        if (retlen < 0) {
+            if (bfdev_likely(retlen == -BFDEV_EAGAIN)) {
+                bfdev_log_debug("sync send link write: wait header\n");
+                return -BFDEV_ENOERR;
+            }
+
+            bfdev_log_err("sync send link write: wait failed\n");
+            return retlen;
+        }
+
+        syncmsg = bfdev_array_data(&sync->service.stream, 0);
+        BFDEV_BUG_ON(!syncmsg);
+
+        cmd = bfdev_le32_to_cpu(syncmsg->id);
+        size = bfdev_le32_to_cpu(syncmsg->size);
+        bfdev_array_reset(&sync->service.stream);
+
+        bfdev_log_debug("sync send link write: cmd '%c%c%c%c' size %u\n",
+            (cmd >> 0) & 0xff, (cmd >> 8) & 0xff, (cmd >> 16) & 0xff,
+            (cmd >> 24) & 0xff, size);
+
+        length -= retlen;
+        data += retlen;
+
+        switch (cmd) {
+            case SYNC_CMD_DATA:
+                break;
+
+            case SYNC_CMD_DONE:
+                bfdev_log_debug("sync send link write: create symlink "
+                    "'%s' -> '%s'\n", sync->filename, sync->symlink);
+                retval = symlink(sync->symlink, sync->filename);
+                if (retval < 0 && errno == ENOENT) {
+                    recursion_mkdir(sync->filename);
+
+                    /* no directory, try again */
+                    retval = symlink(sync->symlink, sync->filename);
+                }
+
+                if (bfdev_unlikely(retval < 0)) {
+                    bfdev_log_warn("sync send link write: failed to create "
+                        "symlink '%s' error %d\n", sync->filename, errno);
+
+                    retval = service_sync_fail(sync, "failed to open file");
+                    if (bfdev_unlikely(retval < 0))
+                        return retval;
+
+                    return -BFDEV_ECANCELED;
+                }
+
+                bfdev_log_info("sync send link write: finish\n");
+                retval = service_sync_status(sync, SYNC_CMD_OKAY, "");
+                if (bfdev_unlikely(retval < 0))
+                    return retval;
+
+                sync->service.write = service_sync_write;
+                retval = service_sync_write(&sync->service, data, length);
+                if (bfdev_unlikely(retval < 0))
+                    return retval;
+
+                return -BFDEV_ENOERR;
+
+            default:
+                sync->service.write = service_sync_write;
+                retval = service_sync_fail(sync, "invalid data message");
+                if (bfdev_unlikely(retval < 0))
+                    return retval;
+
+                return -BFDEV_ENOERR;
+        }
+
+        if (bfdev_unlikely(size > SYNC_MAXDATA)) {
+            sync->service.write = service_sync_write;
+            retval = service_sync_fail(sync, "oversize data message");
+            if (bfdev_unlikely(retval < 0))
+                return retval;
+
+            return -BFDEV_ENOERR;
+        }
+
+        sync->inprogress = size;
+    }
+
+    return -BFDEV_ENOERR;
 }
 
 static int
-service_sync_send(struct sdbd_sync_service *sync, char *filename, void *data, size_t length)
+sync_send_link(struct sdbd_sync_service *sync,
+               void *data, size_t length)
+{
+    int retval;
+
+    sync->symlink[0] = '\0';
+    bfdev_log_debug("sync send link: started '%s'\n", sync->filename);
+
+    sync->service.write = sync_send_link_write;
+    retval = sync_send_link_write(&sync->service, data, length);
+    if (bfdev_unlikely(retval < 0))
+        return retval;
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_sync_send(struct sdbd_sync_service *sync, void *data, size_t length)
 {
     bool islink, isreg;
     mode_t mode;
@@ -2226,7 +2352,7 @@ service_sync_send(struct sdbd_sync_service *sync, char *filename, void *data, si
     islink = false;
     isreg = false;
 
-    flags = strrchr(filename,',');
+    flags = strrchr(sync->filename,',');
     if (!flags)
         mode = 0644;
     else {
@@ -2239,10 +2365,10 @@ service_sync_send(struct sdbd_sync_service *sync, char *filename, void *data, si
 
     /* delete files before copying if they are regular or symlinks. */
     if (islink || isreg)
-        unlink(filename);
+        unlink(sync->filename);
 
     if (islink) {
-        retval = sync_send_link(sync, filename);
+        retval = sync_send_link(sync, data, length);
         if (bfdev_unlikely(retval < 0))
             return retval;
         return -BFDEV_ENOERR;
@@ -2251,7 +2377,7 @@ service_sync_send(struct sdbd_sync_service *sync, char *filename, void *data, si
     mode |= (mode >> 3) & 0070;
     mode |= (mode >> 3) & 0007;
 
-    retval = sync_send_file(sync, filename, mode, data, length);
+    retval = sync_send_file(sync, mode, data, length);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -2290,19 +2416,19 @@ service_sync_write_name(struct sdbd_service *service, void *data, size_t length)
 
     switch (sync->cmd) {
         case SYNC_CMD_STAT: /* header + filename */
-            retval = service_sync_stat(sync, sync->filename);
+            retval = service_sync_stat(sync);
             if (bfdev_unlikely(retval < 0))
                 return retval;
             goto finish;
 
         case SYNC_CMD_LIST: /* header + filename */
-            retval = service_sync_list(sync, sync->filename);
+            retval = service_sync_list(sync);
             if (bfdev_unlikely(retval < 0))
                 return retval;
             goto finish;
 
         case SYNC_CMD_RECV: /* header + filename */
-            retval = service_sync_recv(sync, sync->filename);
+            retval = service_sync_recv(sync);
             if (bfdev_unlikely(retval < 0)) {
                 if (retval == -BFDEV_ECANCELED)
                     return -BFDEV_ENOERR;
@@ -2311,7 +2437,7 @@ service_sync_write_name(struct sdbd_service *service, void *data, size_t length)
             goto finish;
 
         case SYNC_CMD_SEND: /* header + filename + data */
-            retval = service_sync_send(sync, sync->filename, data, length);
+            retval = service_sync_send(sync, data, length);
             if (bfdev_unlikely(retval < 0)) {
                 if (retval == -BFDEV_ECANCELED)
                     return -BFDEV_ENOERR;
