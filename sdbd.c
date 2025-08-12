@@ -27,6 +27,8 @@
 #include <sys/random.h>
 #include <sys/socket.h>
 #include <sys/types.h>
+#include <netinet/in.h>
+#include <netinet/tcp.h>
 #include <inttypes.h>
 #include <dirent.h>
 #include <utime.h>
@@ -510,6 +512,12 @@ struct sdbd_sync_service {
     char filename[SYNC_MAXNAME + 1];
     char symlink[SYNC_MAXDATA + 1];
     uint8_t buff[];
+};
+
+struct sdbd_tcp_service {
+    struct sdbd_service service;
+    bfenv_eproc_event_t event;
+    int socket;
 };
 
 struct sdbd_ctx {
@@ -2677,6 +2685,194 @@ service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
     return &sync->service;
 }
 
+static int
+tcp_loopback_client(int port)
+{
+    struct sockaddr_in addr4;
+    int sock;
+
+    sock = socket(AF_INET, SOCK_STREAM, 0);
+    if (sock < 0)
+        return -BFDEV_EFAULT;
+
+    bzero(&addr4, sizeof(addr4));
+    addr4.sin_family = AF_INET;
+    addr4.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+
+    if (bind(sock, (struct sockaddr *)&addr4, sizeof(addr4)) < 0) {
+        bfdev_log_warn("tcp loopback client: failed to "
+            "bind error %d\n", errno);
+        return -BFDEV_EFAULT;
+    }
+
+    addr4.sin_port = htons(port);
+    if (connect(sock, (struct sockaddr *)&addr4, sizeof(addr4)) < 0) {
+        bfdev_log_debug("tcp loopback client: failed to "
+            "connect error %d\n", errno);
+        return -BFDEV_ECONNRESET;
+    }
+
+    return sock;
+}
+
+static int
+tcp6_loopback_client(int port)
+{
+    struct sockaddr_in6 addr6;
+    int sock;
+
+    sock = socket(AF_INET6, SOCK_STREAM, 0);
+    if (sock < 0)
+        return -BFDEV_EFAULT;
+
+    bzero(&addr6, sizeof(addr6));
+    addr6.sin6_family = AF_INET6;
+    addr6.sin6_addr = in6addr_loopback;
+
+    if (bind(sock, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
+        bfdev_log_warn("tcp6 loopback client: failed to "
+            "bind error %d\n", errno);
+        return -BFDEV_EFAULT;
+    }
+
+    addr6.sin6_port = htons(port);
+    if (connect(sock, (struct sockaddr *)&addr6, sizeof(addr6)) < 0) {
+        bfdev_log_debug("tcp6 loopback client: failed to "
+            "connect error %d\n", errno);
+        return -BFDEV_ECONNRESET;
+    }
+
+    return sock;
+}
+
+static void
+service_tcp_close(struct sdbd_service *service)
+{
+    struct sdbd_tcp_service *tcp;
+
+    bfdev_log_notice("tcp close\n");
+    tcp = bfdev_container_of(service, struct sdbd_tcp_service, service);
+    send_close(tcp->service.sctx, 0, tcp->service.remote);
+
+    bfenv_eproc_event_remove(service->sctx->eproc, &tcp->event);
+    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
+    close(tcp->socket);
+
+    bfdev_array_release(&service->stream);
+    bfdev_radix_free(&service->sctx->services, service->local);
+    bfdev_free(NULL, tcp);
+}
+
+static int
+service_tcp_recv_handle(bfenv_eproc_event_t *event, void *pdata)
+{
+    struct sdbd_tcp_service *tcp;
+    uint8_t buffer[MAX_PAYLOAD];
+    ssize_t retlen;
+    int retval;
+
+    /* socket disconnected */
+    tcp = pdata;
+    if (bfenv_eproc_error_test(&event->events)) {
+        bfdev_log_info("shell handled: disconnected\n");
+        service_tcp_close(&tcp->service);
+        return -BFDEV_ENOERR;
+    }
+
+    for (;;) {
+        retlen = read(tcp->socket, buffer, tcp->service.sctx->max_payload);
+        if (bfdev_unlikely(retlen < 0)) {
+            if (errno == EAGAIN)
+                break;
+            bfdev_log_debug("tcp recv: failed to read %d\n", errno);
+            return retlen;
+        }
+
+        if (!retlen)
+            break;
+
+        retval = send_data(tcp->service.sctx, tcp->service.local,
+            tcp->service.remote, buffer, retlen);
+        if (bfdev_unlikely(retval < 0))
+            return retval;
+    }
+
+    return -BFDEV_ENOERR;
+}
+
+static int
+service_tcp_write(struct sdbd_service *service, void *data, size_t length)
+{
+    struct sdbd_tcp_service *tcp;
+    int retval;
+
+    tcp = bfdev_container_of(service, struct sdbd_tcp_service, service);
+    retval = sdbd_write(tcp->socket, data, length);
+
+    if (bfdev_unlikely(retval < 0)) {
+        bfdev_log_err("tcp write: failed to write %d\n", errno);
+        return retval;
+    }
+
+    return -BFDEV_ENOERR;
+}
+
+static struct sdbd_service *
+service_tcp_open(struct sdbd_ctx *sctx, char *cmdline)
+{
+    struct sdbd_tcp_service *tcp;
+    struct sdbd_service **psrv;
+    int port, retval;
+
+    tcp = bfdev_zalloc(NULL, sizeof(*tcp));
+    if (bfdev_unlikely(!tcp))
+        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+
+    tcp->service.sctx = sctx;
+    tcp->service.remote = sctx->args[0];
+    tcp->service.local = ++sctx->sockid;
+    tcp->service.write = service_tcp_write;
+    tcp->service.close = service_tcp_close;
+    bfdev_array_init(&tcp->service.stream, NULL, sizeof(uint8_t));
+
+    port = strtol(cmdline, NULL, 10);
+    bfdev_log_debug("tcp open: port %d\n", port);
+
+    if (port <= 0 || port > 65535) {
+        bfdev_log_err("tcp open: invalid port %d\n", port);
+        bfdev_free(NULL, tcp);
+        return NULL;
+    }
+
+    tcp->socket = tcp_loopback_client(port);
+    if (tcp->socket < 0) {
+        tcp->socket = tcp6_loopback_client(port);
+        if (tcp->socket < 0) {
+            bfdev_log_warn("tcp open: failed to connect port %d\n", port);
+            bfdev_free(NULL, tcp);
+            return NULL;
+        }
+    }
+
+    tcp->event.fd = tcp->socket;
+    tcp->event.flags = BFENV_EPROC_READ;
+    tcp->event.func = service_tcp_recv_handle;
+    tcp->event.pdata = tcp;
+
+    retval = bfenv_eproc_event_add(tcp->service.sctx->eproc, &tcp->event);
+    if (bfdev_unlikely(retval < 0)) {
+        bfdev_log_err("sync open: failed to add event\n");
+        return BFDEV_ERR_PTR(-BFDEV_EFAULT);
+    }
+
+    psrv = bfdev_radix_alloc(&sctx->services, sctx->sockid);
+    if (bfdev_unlikely(!psrv))
+        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+    *psrv = &tcp->service;
+
+    return &tcp->service;
+}
+
 static struct sdbd_service *
 service_root_open(struct sdbd_ctx *sctx, char *cmdline)
 {
@@ -2778,6 +2974,9 @@ static const struct {
         .name = "sync:",
         .open = service_sync_open,
     }, {
+        .name = "tcp:",
+        .open = service_tcp_open,
+    }, {
         .name = "root:",
         .open = service_root_open,
     }, {
@@ -2833,8 +3032,16 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
 
         cmdline += length;
         service = services[index].open(sctx, cmdline);
-        if (BFDEV_IS_INVAL(service))
-            return BFDEV_PTR_INVAL(service);
+        if (bfdev_unlikely(!service)) {
+            retval = send_close(sctx, 0, sctx->args[0]);
+            if (bfdev_unlikely(retval < 0))
+                return retval;
+
+            return -BFDEV_ENOERR;
+        }
+
+        if (BFDEV_IS_ERR(service))
+            return BFDEV_PTR_ERR(service);
 
         retval = send_okay(sctx, service->local, service->remote);
         if (bfdev_unlikely(retval < 0))
