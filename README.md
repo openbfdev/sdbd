@@ -99,6 +99,10 @@ For bug reporting, please visit:
 <https://github.com/openbfdev/sdbd>
 ```
 
+Static build releases:
+
+[https://github.com/openbfdev/sdbd/releases/tag/nightly](https://github.com/openbfdev/sdbd/releases/tag/nightly)
+
 ## How to build
 
 The project requires **bfdev** and **bfenv** dependencies.
