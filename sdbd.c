@@ -3842,30 +3842,9 @@ error:
 }
 
 static int
-log_redirect_syslog(bfdev_log_message_t *msg, void *pdata)
+log_redirect_file(bfdev_log_message_t *msg)
 {
-    int priority;
-
-    switch (msg->level) {
-        case BFDEV_LEVEL_EMERG:   priority = LOG_EMERG;   break;
-        case BFDEV_LEVEL_ALERT:   priority = LOG_ALERT;   break;
-        case BFDEV_LEVEL_CRIT:    priority = LOG_CRIT;    break;
-        case BFDEV_LEVEL_ERR:     priority = LOG_ERR;     break;
-        case BFDEV_LEVEL_WARNING: priority = LOG_WARNING; break;
-        case BFDEV_LEVEL_NOTICE:  priority = LOG_NOTICE;  break;
-        case BFDEV_LEVEL_INFO:    priority = LOG_INFO;    break;
-        case BFDEV_LEVEL_DEBUG:   priority = LOG_DEBUG;   break;
-        default:                  priority = LOG_INFO;    break;
-    }
-
-    syslog(priority, "%.*s", (int)msg->length, msg->buff);
-    return msg->length;
-}
-
-static int
-log_redirect_file(bfdev_log_message_t *msg, void *pdata)
-{
-    return write((int)(uintptr_t)pdata, msg->buff, msg->length);
+    return write((int)(uintptr_t)msg->log->pdata, msg->buff, msg->length);
 }
 
 static int
@@ -4016,11 +3995,16 @@ options[] = {
 int
 main(int argc, char *const argv[])
 {
+    BFDEV_DEFINE_LOG_CHAIN(log_localtime, bfdev_log_chain_localtime, -300, NULL);
+    BFDEV_DEFINE_LOG_CHAIN(log_hostname, bfdev_log_chain_hostname, -200, NULL);
+    BFDEV_DEFINE_LOG_CHAIN(log_pid, bfdev_log_chain_pid, -100, NULL);
     unsigned long value;
     int arg, optidx, logfd;
     int retval;
+    bool syslog;
 
     logfd = -1;
+    syslog = false;
     sdbd_daemon = false;
     bfdev_log_default.record_level = BFDEV_LEVEL_WARNING;
 
@@ -4055,8 +4039,9 @@ main(int argc, char *const argv[])
                 break;
 
             case 's':
+                syslog = true;
                 openlog(MODULE_NAME, LOG_PID | LOG_CONS, LOG_DAEMON);
-                bfdev_log_default.write = log_redirect_syslog;
+                bfdev_log_default.write = bfdev_log_write_syslog;
                 bfdev_log_color_clr(&bfdev_log_default);
                 break;
 
@@ -4100,6 +4085,12 @@ main(int argc, char *const argv[])
                 fprintf(stderr, "Unknown option: %c\n", arg);
                 usage(argv[0]);
         }
+    }
+
+    if (!syslog) {
+        bfdev_log_chain_register(&bfdev_log_default, &log_localtime);
+        bfdev_log_chain_register(&bfdev_log_default, &log_hostname);
+        bfdev_log_chain_register(&bfdev_log_default, &log_pid);
     }
 
     sdbd_shell = getenv("SHELL");
