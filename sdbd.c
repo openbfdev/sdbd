@@ -1,6 +1,6 @@
 /* SPDX-License-Identifier: GPL-2.0-or-later */
 /*
- * Copyright(c) 2025 John Sanpe <sanpeqf@gmail.com>
+ * Copyright(c) 2025 Zhenlin Wang <sanpeqf@gmail.com>
  */
 
 #include <stdint.h>
