@@ -1482,6 +1482,7 @@ service_shell_close(struct sdbd_service *service)
     }
 
     bfenv_eproc_event_remove(service->sctx->eproc, &shell->stdinout_ev);
+    bfdev_array_release(&shell->escape_buff);
     bfdev_free(NULL, shell->term);
     close(shell->stdinout_fd);
 
