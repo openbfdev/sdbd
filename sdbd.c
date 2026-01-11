@@ -2986,6 +2986,23 @@ service_unroot_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
     return BFDEV_ERR_PTR(-BFDEV_ERESTART);
 }
 
+static struct sdbd_service *
+service_reconnect_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
+{
+    __bfdev_always_unused int dummy;
+    uint32_t local, remote;
+    int retval;
+
+    remote = sctx->args[0];
+    local = ++sctx->sockid;
+
+    retval = send_okay_sync(sctx, local, remote);
+    if (bfdev_unlikely(retval < 0))
+        return BFDEV_ERR_PTR(retval);
+
+    return BFDEV_ERR_PTR(-BFDEV_ERESTART);
+}
+
 static const struct sdbd_service_id
 services[] = {
     {
@@ -3012,6 +3029,9 @@ services[] = {
     }, {
         .name = "unroot:",
         .open = service_unroot_open,
+    }, {
+        .name = "reconnect",
+        .open = service_reconnect_open,
     },
 };
 
