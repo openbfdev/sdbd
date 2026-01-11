@@ -1,6 +1,8 @@
-/* SPDX-License-Identifier: GPL-2.0-or-later */
+// SPDX-License-Identifier: GPL-2.0-or-later
 /*
- * Copyright(c) 2025 Zhenlin Wang <sanpeqf@gmail.com>
+ * Copyright (c) 2025, Zhenlin Wang <zhenlin.wang@openbfdev.com>
+ * Copyright (c) 2026, Openbfdev Organization
+ * All rights reserved.
  */
 
 #include <stdint.h>
@@ -475,6 +477,12 @@ struct sdbd_service {
     uint32_t remote;
 };
 
+struct sdbd_service_id {
+    const char *name;
+    const void *data;
+    struct sdbd_service *(*open)(struct sdbd_ctx *sctx, char *cmdline, const void *data);
+};
+
 struct sdbd_shell_service {
     struct sdbd_service service;
     bfenv_eproc_event_t stdinout_ev;
@@ -692,7 +700,20 @@ async_usb_write(struct sdbd_ctx *sctx, const void *data, size_t size)
 }
 
 static int
-write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
+real_write_packet(struct sdbd_ctx *sctx, const void *data, size_t size, bool sync)
+{
+    int retval;
+
+    if (sync)
+        retval = sdbd_write(sctx->fd_in, data, size);
+    else
+        retval = async_usb_write(sctx, data, size);
+
+    return retval;
+}
+
+static int
+write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload, bool sync)
 {
     struct adb_message message;
     int retval;
@@ -705,14 +726,14 @@ write_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
     message.magic = bfdev_cpu_to_le32(packet->magic);
 
     bfdev_log_debug("usbio write: message\n");
-    retval = async_usb_write(sctx, &message, sizeof(message));
+    retval = real_write_packet(sctx, &message, sizeof(message), sync);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
     if (packet->length) {
         BFDEV_BUG_ON(!payload);
         bfdev_log_debug("usbio write: payload\n");
-        retval = async_usb_write(sctx, payload, packet->length);
+        retval = real_write_packet(sctx, payload, packet->length, sync);
         if (bfdev_unlikely(retval < 0))
             return retval;
     }
@@ -1001,7 +1022,7 @@ auth_verify(struct sdbd_ctx *sctx, void *sig, int siglen)
 }
 
 static int
-send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
+send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload, bool sync)
 {
     uint32_t cksum, magic;
 
@@ -1012,7 +1033,7 @@ send_packet(struct sdbd_ctx *sctx, struct sdbd_packet *packet, void *payload)
     packet->cksum = cksum;
     packet->magic = magic;
 
-    return write_packet(sctx, packet, payload);
+    return write_packet(sctx, packet, payload, sync);
 }
 
 static int
@@ -1027,7 +1048,7 @@ send_close(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
     packet.length = 0;
 
     bfdev_log_info("send close: local %u remote %u\n", local, remote);
-    retval = send_packet(sctx, &packet, NULL);
+    retval = send_packet(sctx, &packet, NULL, false);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -1035,7 +1056,7 @@ send_close(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
 }
 
 static int
-send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
+send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, bool sync)
 {
     struct sdbd_packet packet;
     int retval;
@@ -1046,7 +1067,7 @@ send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
     packet.length = 0;
 
     bfdev_log_info("send okay: local %u remote %u\n", local, remote);
-    retval = send_packet(sctx, &packet, NULL);
+    retval = send_packet(sctx, &packet, NULL, false);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -1054,12 +1075,12 @@ send_okay(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
 }
 
 static int
-send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
-          void *data, size_t size)
+send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size, bool sync)
 {
     struct sdbd_packet packet;
     int retval;
 
+    BFDEV_BUG_ON(size > sctx->max_payload);
     packet.command = PCMD_WRTE;
     packet.args[0] = local;
     packet.args[1] = remote;
@@ -1067,7 +1088,7 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
 
     bfdev_log_debug("send data: local %u remote %u size %zu\n",
         local, remote, size);
-    retval = send_packet(sctx, &packet, data);
+    retval = send_packet(sctx, &packet, data, sync);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -1075,8 +1096,7 @@ send_data(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
 }
 
 static int
-send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
-           void *data, size_t size)
+send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size, bool sync)
 {
     size_t xfer;
     int retval;
@@ -1084,7 +1104,7 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
     bfdev_log_debug("send datas: local %u remote %u size %zu\n",
         local, remote, size);
     for (; (xfer = bfdev_min(size, sctx->max_payload)); size -= xfer) {
-        retval = send_data(sctx, local, remote, data, xfer);
+        retval = send_data(sctx, local, remote, data, xfer, sync);
         if (bfdev_unlikely(retval < 0))
             return retval;
         data += xfer;
@@ -1094,9 +1114,39 @@ send_datas(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote,
 }
 
 static int
-send_string(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, const char *data)
+send_string(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, const char *data, bool sync)
 {
-    return send_datas(sctx, local, remote, (void *)data, strlen(data));
+    return send_datas(sctx, local, remote, (void *)data, strlen(data), sync);
+}
+
+static int
+send_okay_async(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
+{
+    return send_okay(sctx, local, remote, false);
+}
+
+static int
+send_okay_sync(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote)
+{
+    return send_okay(sctx, local, remote, true);
+}
+
+static int
+send_data_async(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size)
+{
+    return send_data(sctx, local, remote, data, size, false);
+}
+
+static int
+send_datas_async(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, void *data, size_t size)
+{
+    return send_datas(sctx, local, remote, data, size, false);
+}
+
+static int
+send_string_sync(struct sdbd_ctx *sctx, uint32_t local, uint32_t remote, const char *data)
+{
+    return send_string(sctx, local, remote, data, true);
 }
 
 static int
@@ -1174,7 +1224,7 @@ send_connect(struct sdbd_ctx *sctx)
     bfdev_log_info("send connect: '%s'\n", payload);
     packet.length = length;
 
-    retval = send_packet(sctx, &packet, payload);
+    retval = send_packet(sctx, &packet, payload, false);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -1198,7 +1248,7 @@ send_auth_request(struct sdbd_ctx *sctx)
     bfdev_log_info("send auth request\n");
     packet.length = TOKEN_SIZE;
 
-    retval = send_packet(sctx, &packet, sctx->token);
+    retval = send_packet(sctx, &packet, sctx->token, false);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -1208,7 +1258,8 @@ send_auth_request(struct sdbd_ctx *sctx)
 static void
 iothread_release(bfenv_iothread_request_t *request, void *pdata)
 {
-    free(request->buffer);
+    bfdev_log_debug("iothread release: free %p\n", request->buffer);
+    bfdev_free(NULL, request->buffer);
 }
 
 static void
@@ -1217,7 +1268,6 @@ service_release(struct sdbd_service *service)
     bfdev_array_release(&service->stream);
     bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfdev_radix_free(&service->sctx->services, service->local);
-    bfdev_free(NULL, service);
 }
 
 static int
@@ -1432,12 +1482,10 @@ service_shell_close(struct sdbd_service *service)
     }
 
     bfenv_eproc_event_remove(service->sctx->eproc, &shell->stdinout_ev);
-    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfdev_free(NULL, shell->term);
     close(shell->stdinout_fd);
 
-    bfdev_array_release(&service->stream);
-    bfdev_radix_free(&service->sctx->services, service->local);
+    service_release(service);
     bfdev_free(NULL, shell);
 }
 
@@ -1589,7 +1637,7 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
         return -BFDEV_EIO;
 
     if (!shell->v2) {
-        retval = send_data(shell->service.sctx, shell->service.local,
+        retval = send_data_async(shell->service.sctx, shell->service.local,
             shell->service.remote, buffer, length);
         if (bfdev_unlikely(retval < 0))
             return retval;
@@ -1601,12 +1649,12 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
         SHELL_CMD_STDERR : SHELL_CMD_STDOUT;
     shellmsg.size = bfdev_cpu_to_le32(length);
 
-    retval = send_data(shell->service.sctx, shell->service.local,
+    retval = send_data_async(shell->service.sctx, shell->service.local,
         shell->service.remote, &shellmsg, sizeof(shellmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
 
-    retval = send_data(shell->service.sctx, shell->service.local,
+    retval = send_data_async(shell->service.sctx, shell->service.local,
         shell->service.remote, buffer, length);
     if (bfdev_unlikely(retval < 0))
         return retval;
@@ -1615,7 +1663,7 @@ service_shell_handle(bfenv_eproc_event_t *event, void *pdata)
 }
 
 static struct sdbd_service *
-service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
+service_shell_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_shell_service *shell;
     struct sdbd_service **psrv;
@@ -1719,14 +1767,14 @@ service_shell_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static struct sdbd_service *
-service_exec_open(struct sdbd_ctx *sctx, char *cmdline)
+service_exec_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_service *service;
     char buff[MAX_PAYLOAD];
 
     bfdev_log_notice("exec open: cmdline '%s'\n", cmdline);
     bfdev_scnprintf(buff, sizeof(buff), "raw:%s", cmdline);
-    service = service_shell_open(sctx, buff);
+    service = service_shell_open(sctx, buff, data);
     if (bfdev_unlikely(!service))
         return NULL;
 
@@ -1734,14 +1782,14 @@ service_exec_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static struct sdbd_service *
-service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
+service_reboot_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_service *service;
     char buff[MAX_PAYLOAD];
 
     bfdev_log_notice("reboot open: cmdline '%s'\n", cmdline);
     bfdev_scnprintf(buff, sizeof(buff), ":reboot %s", cmdline);
-    service = service_shell_open(sctx, buff);
+    service = service_shell_open(sctx, buff, data);
     if (bfdev_unlikely(!service))
         return NULL;
 
@@ -1749,12 +1797,12 @@ service_reboot_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static struct sdbd_service *
-service_remount_open(struct sdbd_ctx *sctx, char *cmdline)
+service_remount_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_service *service;
 
     bfdev_log_notice("remount open\n");
-    service = service_shell_open(sctx, ":mount -o remount,rw /system");
+    service = service_shell_open(sctx, ":mount -o remount,rw /system", data);
     if (bfdev_unlikely(!service))
         return NULL;
 
@@ -1774,11 +1822,9 @@ service_sync_close(struct sdbd_service *service)
         close(sync->fd);
 
     bfenv_eproc_event_remove(service->sctx->eproc, &sync->event);
-    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     bfenv_iothread_destory(sync->fileio, NULL, NULL);
 
-    bfdev_array_release(&service->stream);
-    bfdev_radix_free(&service->sctx->services, service->local);
+    service_release(service);
     bfdev_free(NULL, sync);
 }
 
@@ -1793,13 +1839,13 @@ service_sync_status(struct sdbd_sync_service *sync, uint32_t cmd, char *msg)
     syncmsg.id = bfdev_cpu_to_le32(cmd);
     syncmsg.msglen = bfdev_cpu_to_le32(length);
 
-    retval = send_data(sync->service.sctx, sync->service.local,
+    retval = send_data_async(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
 
     if (length) {
-        retval = send_datas(sync->service.sctx, sync->service.local,
+        retval = send_datas_async(sync->service.sctx, sync->service.local,
             sync->service.remote, msg, length);
         if (bfdev_unlikely(retval < 0))
             return retval;
@@ -1842,7 +1888,7 @@ service_sync_stat(struct sdbd_sync_service *sync)
         syncmsg.time = bfdev_cpu_to_le32(stbuf.st_mtime);
     }
 
-    retval = send_data(sync->service.sctx, sync->service.local,
+    retval = send_data_async(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
@@ -1873,7 +1919,7 @@ service_sync_stat2(struct sdbd_sync_service *sync)
         syncmsg.ctime = bfdev_cpu_to_le64(stbuf.st_ctime);
     }
 
-    retval = send_data(sync->service.sctx, sync->service.local,
+    retval = send_data_async(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
@@ -1904,7 +1950,7 @@ service_sync_lstat2(struct sdbd_sync_service *sync)
         syncmsg.ctime = bfdev_cpu_to_le64(stbuf.st_ctime);
     }
 
-    retval = send_data(sync->service.sctx, sync->service.local,
+    retval = send_data_async(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
@@ -1946,12 +1992,12 @@ service_sync_list(struct sdbd_sync_service *sync)
             syncmsg.time = bfdev_cpu_to_le32(stbuf.st_mtime);
             syncmsg.namelen = bfdev_cpu_to_le32(filelen);
 
-            retval = send_data(sync->service.sctx, sync->service.local,
+            retval = send_data_async(sync->service.sctx, sync->service.local,
                 sync->service.remote, &syncmsg, sizeof(syncmsg));
             if (bfdev_unlikely(retval < 0))
                 return retval;
 
-            retval = send_data(sync->service.sctx, sync->service.local,
+            retval = send_data_async(sync->service.sctx, sync->service.local,
                 sync->service.remote, dirent->d_name, filelen);
             if (bfdev_unlikely(retval < 0))
                 return retval;
@@ -1967,7 +2013,7 @@ done:
     syncmsg.time = bfdev_cpu_to_le32(0);
     syncmsg.namelen = bfdev_cpu_to_le32(0);
 
-    retval = send_data(sync->service.sctx, sync->service.local,
+    retval = send_data_async(sync->service.sctx, sync->service.local,
         sync->service.remote, &syncmsg, sizeof(syncmsg));
     if (bfdev_unlikely(retval < 0))
         return retval;
@@ -2003,7 +2049,7 @@ sync_recv_batch_write(struct sdbd_sync_service *sync, void *data, size_t size)
     total = bfdev_array_size(&sync->service.stream);
     BFDEV_BUG_ON(!batch);
 
-    retval = send_datas(sync->service.sctx, sync->service.local,
+    retval = send_datas_async(sync->service.sctx, sync->service.local,
         sync->service.remote, batch, total);
     if (bfdev_unlikely(retval < 0))
         return retval;
@@ -2058,7 +2104,7 @@ service_sync_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         syncmsg.size = bfdev_cpu_to_le32(0);
 
         bfdev_log_info("shell recv handled: finish\n");
-        retval = send_data(sync->service.sctx, sync->service.local,
+        retval = send_data_async(sync->service.sctx, sync->service.local,
             sync->service.remote, &syncmsg, sizeof(syncmsg));
         if (bfdev_unlikely(retval < 0))
             return retval;
@@ -2640,7 +2686,7 @@ service_sync_write(struct sdbd_service *service, void *data, size_t length)
 }
 
 static struct sdbd_service *
-service_sync_open(struct sdbd_ctx *sctx, char *cmdline)
+service_sync_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_sync_service *sync;
     struct sdbd_service **psrv;
@@ -2756,11 +2802,9 @@ service_tcp_close(struct sdbd_service *service)
     send_close(tcp->service.sctx, 0, tcp->service.remote);
 
     bfenv_eproc_event_remove(service->sctx->eproc, &tcp->event);
-    bfenv_eproc_timer_remove(service->sctx->eproc, &service->timer);
     close(tcp->socket);
 
-    bfdev_array_release(&service->stream);
-    bfdev_radix_free(&service->sctx->services, service->local);
+    service_release(service);
     bfdev_free(NULL, tcp);
 }
 
@@ -2792,7 +2836,7 @@ service_tcp_recv_handle(bfenv_eproc_event_t *event, void *pdata)
         if (!retlen)
             break;
 
-        retval = send_data(tcp->service.sctx, tcp->service.local,
+        retval = send_data_async(tcp->service.sctx, tcp->service.local,
             tcp->service.remote, buffer, retlen);
         if (bfdev_unlikely(retval < 0))
             return retval;
@@ -2819,7 +2863,7 @@ service_tcp_write(struct sdbd_service *service, void *data, size_t length)
 }
 
 static struct sdbd_service *
-service_tcp_open(struct sdbd_ctx *sctx, char *cmdline)
+service_tcp_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
     struct sdbd_tcp_service *tcp;
     struct sdbd_service **psrv;
@@ -2875,28 +2919,21 @@ service_tcp_open(struct sdbd_ctx *sctx, char *cmdline)
 }
 
 static struct sdbd_service *
-service_root_open(struct sdbd_ctx *sctx, char *cmdline)
+service_root_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
-    struct sdbd_service *service;
     __bfdev_always_unused int dummy;
+    uint32_t local, remote;
     int retval;
 
-    service = bfdev_zalloc(NULL, sizeof(*service));
-    if (bfdev_unlikely(!service))
-        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+    remote = sctx->args[0];
+    local = ++sctx->sockid;
 
-    service->sctx = sctx;
-    service->remote = sctx->args[0];
-    service->local = ++sctx->sockid;
-    service->close = service_release;
-    bfdev_array_init(&service->stream, NULL, sizeof(uint8_t));
-
-    retval = send_okay(sctx, service->local, service->remote);
+    retval = send_okay_sync(sctx, local, remote);
     if (bfdev_unlikely(retval < 0))
         return BFDEV_ERR_PTR(retval);
 
     if (getuid() == 0) {
-        retval = send_string(sctx, service->local, service->remote,
+        retval = send_string_sync(sctx, local, remote,
             "remote: already running as root\n");
         if (bfdev_unlikely(retval < 0))
             return BFDEV_ERR_PTR(retval);
@@ -2905,60 +2942,51 @@ service_root_open(struct sdbd_ctx *sctx, char *cmdline)
         dummy = setuid(0);
         dummy = setgid(0);
 
-        retval = send_string(sctx, service->local, service->remote,
+        retval = send_string_sync(sctx, local, remote,
             "remote: restarting adbd as root\n");
         if (bfdev_unlikely(retval < 0))
             return BFDEV_ERR_PTR(retval);
     }
 
-    return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
+    return BFDEV_ERR_PTR(-BFDEV_ERESTART);
 }
 
 static struct sdbd_service *
-service_unroot_open(struct sdbd_ctx *sctx, char *cmdline)
+service_unroot_open(struct sdbd_ctx *sctx, char *cmdline, const void *data)
 {
-    struct sdbd_service *service;
     __bfdev_always_unused int dummy;
+    uint32_t local, remote;
     int retval;
 
-    service = bfdev_zalloc(NULL, sizeof(*service));
-    if (bfdev_unlikely(!service))
-        return BFDEV_ERR_PTR(-BFDEV_ENOMEM);
+    remote = sctx->args[0];
+    local = ++sctx->sockid;
 
-    service->sctx = sctx;
-    service->remote = sctx->args[0];
-    service->local = ++sctx->sockid;
-    service->close = service_release;
-    bfdev_array_init(&service->stream, NULL, sizeof(uint8_t));
-
-    retval = send_okay(sctx, service->local, service->remote);
+    retval = send_okay_sync(sctx, local, remote);
     if (bfdev_unlikely(retval < 0))
         return BFDEV_ERR_PTR(retval);
 
     if (getuid() != 0) {
-        retval = send_string(sctx, service->local, service->remote,
+        retval = send_string_sync(sctx, local, remote,
             "remote: already running as non root\n");
         if (bfdev_unlikely(retval < 0))
             return BFDEV_ERR_PTR(retval);
 
-        return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
+        return BFDEV_ERR_PTR(-BFDEV_ERESTART);
     } else {
         dummy = setuid(sdbd_origin_uid);
         dummy = setgid(sdbd_origin_uid);
 
-        retval = send_string(sctx, service->local, service->remote,
+        retval = send_string_sync(sctx, local, remote,
             "remote: restarting adbd as non root\n");
         if (bfdev_unlikely(retval < 0))
             return BFDEV_ERR_PTR(retval);
     }
 
-    return BFDEV_ERR_PTR(-BFDEV_ESHUTDOWN);
+    return BFDEV_ERR_PTR(-BFDEV_ERESTART);
 }
 
-static const struct {
-    const char *name;
-    struct sdbd_service *(*open)(struct sdbd_ctx *sctx, char *cmdline);
-} services[] = {
+static const struct sdbd_service_id
+services[] = {
     {
         .name = "shell",
         .open = service_shell_open,
@@ -3025,14 +3053,16 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
     int retval;
 
     for (index = 0; index < BFDEV_ARRAY_SIZE(services); ++index) {
+        const struct sdbd_service_id *match;
         size_t length;
 
-        length = strlen(services[index].name);
-        if (strncmp(cmdline, services[index].name, length))
+        match = &services[index];
+        length = strlen(match->name);
+        if (strncmp(cmdline, match->name, length))
             continue;
 
         cmdline += length;
-        service = services[index].open(sctx, cmdline);
+        service = match->open(sctx, cmdline, match->data);
         if (bfdev_unlikely(!service)) {
             retval = send_close(sctx, 0, sctx->args[0]);
             if (bfdev_unlikely(retval < 0))
@@ -3044,7 +3074,7 @@ service_open(struct sdbd_ctx *sctx, char *cmdline)
         if (BFDEV_IS_ERR(service))
             return BFDEV_PTR_ERR(service);
 
-        retval = send_okay(sctx, service->local, service->remote);
+        retval = send_okay_async(sctx, service->local, service->remote);
         if (bfdev_unlikely(retval < 0))
             return retval;
 
@@ -3092,7 +3122,7 @@ service_write(struct sdbd_ctx *sctx, uint8_t *payload)
     if (bfdev_unlikely(retval < 0))
         return retval;
 
-    retval = send_okay(sctx, local, remote);
+    retval = send_okay_async(sctx, local, remote);
     if (bfdev_unlikely(retval < 0))
         return retval;
 
@@ -3807,6 +3837,7 @@ sdbd(void)
             continue;
 
         switch (retval) {
+            case -BFDEV_ERESTART:
             case -BFDEV_ESHUTDOWN:
                 bfdev_log_warn("usb reconnecting\n");
                 sctx.verified = false;
